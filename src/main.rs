@@ -2,14 +2,27 @@
 //!
 //! Target platform: Linux (Wayland via PipeWire/portal, and X11).
 //!
-//! This is an early scaffold. The real capture pipeline (PipeWire/portal screen
-//! capture -> encoder -> ring buffer) is stubbed out; see `docs/ARCHITECTURE.md`.
+//! Architecture (see `docs/ARCHITECTURE.md`):
+//!   capture ([`capture::FrameSource`]) -> encode ([`encode::Encoder`])
+//!   -> rolling [`buffer::ClipBuffer`] -> save/mux ([`encode::Muxer`]),
+//!   orchestrated by [`pipeline::Pipeline`] and driven by the GUI or CLI.
 //!
-//! Build the native GTK4 + libadwaita GUI with `cargo run --features gui`.
-//! Without the feature, this runs a headless CLI stub that exercises the buffer.
+//! The core (buffer, config, traits, orchestrator) is dependency-free and builds
+//! on any host. The GTK GUI and the Linux capture/encode/hotkey backends are
+//! behind cargo features so the default build stays green everywhere.
+//!
+//! Build the full Linux app with:  `cargo run --features linux`
+
+// Feature-gated backends leave several core APIs unused in the default build.
+#![allow(dead_code)]
 
 mod buffer;
+mod capture;
 mod config;
+mod encode;
+mod hotkey;
+mod media;
+mod pipeline;
 
 #[cfg(feature = "gui")]
 mod gui;
@@ -20,38 +33,45 @@ fn main() {
     gui::run();
 }
 
-/// Headless CLI stub — used when built without the `gui` feature.
+/// Headless CLI entry point — used when built without the `gui` feature.
 #[cfg(not(feature = "gui"))]
 fn main() {
-    use buffer::ClipBuffer;
+    use std::sync::Arc;
+    use std::time::Duration;
+
     use config::Config;
+    use pipeline::{Pipeline, PipelineEvent};
 
     println!("Rewind v{} — privacy-first clip recorder", env!("CARGO_PKG_VERSION"));
     println!("No account. No telemetry. Your footage stays on your machine.\n");
 
     let config = Config::default();
     println!(
-        "Config: buffer={}s, output={:?}, hotkey={}",
-        config.buffer_seconds, config.output_dir, config.save_hotkey
+        "Config: buffer={}s, fps={}, output={:?}, hotkey={}",
+        config.buffer_seconds, config.target_fps, config.output_dir, config.save_hotkey
     );
 
-    // A ring buffer sized to hold `buffer_seconds` of frames at the target FPS.
-    let mut clip_buffer = ClipBuffer::new(config.buffer_seconds, config.target_fps);
-    println!(
-        "Initialized ring buffer: capacity = {} frames.\n",
-        clip_buffer.capacity()
-    );
+    let events: pipeline::EventSink = Arc::new(|event: PipelineEvent| match event {
+        PipelineEvent::Status(s) => println!("[status] {s}"),
+        PipelineEvent::ClipSaved(p) => println!("[saved]  clip written to {}", p.display()),
+        PipelineEvent::Error(e) => eprintln!("[error]  {e}"),
+    });
 
-    // TODO: start the capture thread that pushes frames into `clip_buffer`,
-    // and register the global hotkey that calls `clip_buffer.flush_to_clip()`.
-    println!("[stub] Capture pipeline not yet implemented — see docs/ARCHITECTURE.md.");
-    println!("[stub] Would open a PipeWire/portal ScreenCast (Wayland) or X11 capture and begin buffering.");
-    println!("[stub] Tip: build the GUI with `cargo run --features gui`.\n");
-
-    // Demonstrate the buffer API so the skeleton is exercised and buildable.
-    clip_buffer.push_frame_placeholder();
-    match clip_buffer.flush_to_clip(&config.output_dir) {
-        Ok(path) => println!("[stub] Clip would be saved to: {}", path),
-        Err(e) => eprintln!("[stub] Save failed: {e}"),
+    let mut pipeline = Pipeline::new(config, events);
+    match pipeline.start() {
+        Ok(()) if pipeline.is_running() => {
+            println!("\nCapturing. Recording the rolling buffer for a few seconds…");
+            std::thread::sleep(Duration::from_secs(3));
+            println!("Flushing the last N seconds to a clip…");
+            pipeline.save_last_n();
+            std::thread::sleep(Duration::from_secs(1));
+            pipeline.stop();
+        }
+        Ok(()) => println!("Pipeline did not start capturing."),
+        Err(e) => {
+            eprintln!("\n[error] could not start capture: {e}");
+            eprintln!("This build has no Linux capture backend compiled in.");
+            eprintln!("On Linux, build the real app with: cargo run --features linux");
+        }
     }
 }

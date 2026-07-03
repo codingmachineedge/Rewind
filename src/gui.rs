@@ -1,34 +1,29 @@
 //! Native Linux GUI — GTK4 + libadwaita (via gtk4-rs).
 //!
-//! A minimal but real control surface wired to the existing [`Config`] and
-//! [`ClipBuffer`] stubs. The capture pipeline isn't implemented yet, so toggling
-//! capture and saving update in-memory state and the status text rather than
-//! moving real frames — the widgets and wiring are real and ready for the
-//! pipeline to be dropped in behind them.
+//! A real control surface wired to the live [`Pipeline`]: the toggle starts and
+//! stops capture, the button flushes the rolling buffer to a clip, the settings
+//! rows feed [`Config`], and pipeline events are marshalled back onto the GTK
+//! main thread to update the status line.
 
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use gtk4 as gtk;
 use libadwaita as adw;
 
+// `adw::prelude` re-exports the gtk4 prelude, so we don't import it separately.
 use adw::prelude::*;
-use gtk::prelude::*;
 
 use gtk::{Align, Button, Entry, Label, Orientation, SpinButton, ToggleButton};
 
-use crate::buffer::ClipBuffer;
 use crate::config::Config;
+use crate::pipeline::{EventSink, Pipeline, PipelineEvent};
 
 const APP_ID: &str = "org.rewind.Rewind";
-
-/// Shared runtime state the widgets read and mutate.
-struct AppState {
-    config: Config,
-    buffer: ClipBuffer,
-    capturing: bool,
-}
 
 /// Launch the application. Blocks until the window is closed.
 pub fn run() {
@@ -38,15 +33,21 @@ pub fn run() {
 }
 
 fn build_ui(app: &adw::Application) {
-    let config = Config::default();
-    let buffer = ClipBuffer::new(config.buffer_seconds, config.target_fps);
-    let state = Rc::new(RefCell::new(AppState {
-        config: config.clone(),
-        buffer,
-        capturing: false,
-    }));
+    // Channel to marshal pipeline events (from worker threads) to the UI thread.
+    let (tx, rx): (Sender<PipelineEvent>, Receiver<PipelineEvent>) = std::sync::mpsc::channel();
+    // The event callback must be Send + Sync; wrap the Sender in a Mutex.
+    let tx = Mutex::new(tx);
+    let events: EventSink = Arc::new(move |event: PipelineEvent| {
+        if let Ok(tx) = tx.lock() {
+            let _ = tx.send(event);
+        }
+    });
 
-    // Root: header bar on top, content below.
+    let pipeline = Rc::new(RefCell::new(Pipeline::new(Config::default(), events)));
+    let core = pipeline.borrow().core();
+
+    // --- Widgets --------------------------------------------------------------
+
     let root = gtk::Box::new(Orientation::Vertical, 0);
 
     let header = adw::HeaderBar::new();
@@ -65,12 +66,11 @@ fn build_ui(app: &adw::Application) {
         .margin_end(18)
         .build();
 
-    // Status line.
     let status = Label::new(Some("Idle — not capturing."));
     status.set_halign(Align::Start);
+    status.set_wrap(true);
     status.add_css_class("title-4");
 
-    // Capture toggle + save button.
     let controls = gtk::Box::new(Orientation::Horizontal, 12);
     let toggle = ToggleButton::with_label("Start Capture");
     toggle.add_css_class("suggested-action");
@@ -79,11 +79,10 @@ fn build_ui(app: &adw::Application) {
     controls.append(&toggle);
     controls.append(&save_btn);
 
-    // Settings, as libadwaita preference rows.
     let group = adw::PreferencesGroup::builder().title("Settings").build();
 
     let buffer_spin = SpinButton::with_range(5.0, 600.0, 5.0);
-    buffer_spin.set_value(config.buffer_seconds as f64);
+    buffer_spin.set_value(Config::default().buffer_seconds as f64);
     buffer_spin.set_valign(Align::Center);
     let buffer_row = adw::ActionRow::builder()
         .title("Buffer length (seconds)")
@@ -93,7 +92,7 @@ fn build_ui(app: &adw::Application) {
     group.add(&buffer_row);
 
     let folder_entry = Entry::new();
-    folder_entry.set_text(&config.output_dir.display().to_string());
+    folder_entry.set_text(&Config::default().output_dir.display().to_string());
     folder_entry.set_hexpand(true);
     folder_entry.set_valign(Align::Center);
     let folder_row = adw::ActionRow::builder().title("Output folder").build();
@@ -101,7 +100,7 @@ fn build_ui(app: &adw::Application) {
     group.add(&folder_row);
 
     let hotkey_entry = Entry::new();
-    hotkey_entry.set_text(&config.save_hotkey);
+    hotkey_entry.set_text(&Config::default().save_hotkey);
     hotkey_entry.set_valign(Align::Center);
     let hotkey_row = adw::ActionRow::builder().title("Save hotkey").build();
     hotkey_row.add_suffix(&hotkey_entry);
@@ -112,59 +111,91 @@ fn build_ui(app: &adw::Application) {
     content.append(&group);
     root.append(&content);
 
+    // --- Event pump: drain pipeline events on the UI thread -------------------
+    {
+        let status = status.clone();
+        gtk::glib::timeout_add_local(Duration::from_millis(120), move || {
+            while let Ok(event) = rx.try_recv() {
+                match event {
+                    PipelineEvent::Status(s) => status.set_text(&s),
+                    PipelineEvent::ClipSaved(p) => {
+                        status.set_text(&format!("Saved clip → {}", p.display()))
+                    }
+                    PipelineEvent::Error(e) => status.set_text(&format!("⚠ {e}")),
+                }
+            }
+            gtk::glib::ControlFlow::Continue
+        });
+    }
+
     // --- Wiring ---------------------------------------------------------------
 
-    // Start/stop capture. Resizes the buffer to the current setting on start.
+    // Push the current settings into the pipeline's config before (re)starting.
+    let apply_settings = {
+        let core = core.clone();
+        let buffer_spin = buffer_spin.clone();
+        let folder_entry = folder_entry.clone();
+        let hotkey_entry = hotkey_entry.clone();
+        move || {
+            let mut cfg = core.config.lock().unwrap();
+            cfg.buffer_seconds = buffer_spin.value() as u32;
+            cfg.output_dir = PathBuf::from(folder_entry.text().as_str());
+            cfg.save_hotkey = hotkey_entry.text().to_string();
+        }
+    };
+
+    // Start/stop capture.
     {
-        let state = state.clone();
+        let pipeline = pipeline.clone();
         let status = status.clone();
         let save_btn = save_btn.clone();
-        let buffer_spin = buffer_spin.clone();
+        let apply_settings = apply_settings.clone();
         toggle.connect_toggled(move |btn| {
-            let mut st = state.borrow_mut();
-            st.capturing = btn.is_active();
-            if st.capturing {
-                let seconds = buffer_spin.value() as u32;
-                st.config.buffer_seconds = seconds;
-                st.buffer = ClipBuffer::new(seconds, st.config.target_fps);
-                btn.set_label("Stop Capture");
-                status.set_text(&format!(
-                    "Capturing… buffering last {seconds}s ({} frames).",
-                    st.buffer.capacity()
-                ));
-                save_btn.set_sensitive(true);
+            if btn.is_active() {
+                apply_settings();
+                match pipeline.borrow_mut().start() {
+                    Ok(()) => {
+                        btn.set_label("Stop Capture");
+                        save_btn.set_sensitive(true);
+                    }
+                    Err(e) => {
+                        status.set_text(&format!("⚠ could not start capture: {e}"));
+                        btn.set_active(false);
+                    }
+                }
             } else {
+                pipeline.borrow_mut().stop();
                 btn.set_label("Start Capture");
-                status.set_text("Idle — not capturing.");
                 save_btn.set_sensitive(false);
+                status.set_text("Idle — not capturing.");
             }
         });
     }
 
-    // Save last N seconds: flush the buffer to a clip in the chosen folder.
+    // Save last N seconds — flush the rolling buffer to a clip.
     {
-        let state = state.clone();
-        let status = status.clone();
-        let folder_entry = folder_entry.clone();
+        let core = core.clone();
         save_btn.connect_clicked(move |_| {
-            let mut st = state.borrow_mut();
-            // Stub: push a placeholder frame so there is something to flush.
-            st.buffer.push_frame_placeholder();
-            let out = PathBuf::from(folder_entry.text().as_str());
-            match st.buffer.flush_to_clip(&out) {
-                Ok(path) => status.set_text(&format!("Saved clip → {path}")),
-                Err(e) => status.set_text(&format!("Save failed: {e}")),
-            }
+            core.save_last_n();
         });
     }
 
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("Rewind")
-        .default_width(440)
-        .default_height(380)
+        .default_width(460)
+        .default_height(400)
         .content(&root)
         .build();
+
+    // Ensure the pipeline is stopped when the window closes.
+    {
+        let pipeline = pipeline.clone();
+        window.connect_close_request(move |_| {
+            pipeline.borrow_mut().stop();
+            gtk::glib::Propagation::Proceed
+        });
+    }
 
     window.present();
 }

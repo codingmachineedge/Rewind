@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Core builds and tests on any platform — no system deps.
+  core:
+    name: Core (headless, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --verbose
+      - run: cargo test --verbose
+
+  # Full Linux app — compile-verifies the feature-gated backends
+  # (Wayland/PipeWire, X11/XShm, GStreamer, portal/evdev, GTK4).
+  linux:
+    name: Linux backends (--features linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libgtk-4-dev libadwaita-1-dev \
+            libpipewire-0.3-dev libspa-0.2-dev \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            libxcb1-dev libxcb-shm0-dev libxcb-composite0-dev \
+            libevdev-dev libclang-dev
+      - name: Build all features
+        run: cargo build --features linux --verbose
+      - name: Clippy (backends)
+        run: cargo clippy --features linux -- -D warnings
+        continue-on-error: true

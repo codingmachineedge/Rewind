@@ -1,81 +1,100 @@
 //! Rolling in-memory clip buffer.
 //!
-//! The core idea of Rewind: frames are continuously encoded into a fixed-size
-//! ring buffer. When the user presses the save hotkey, the buffer's contents
-//! (the last N seconds) are flushed to a container file on disk. Nothing touches
-//! the disk until the user asks for it.
+//! The core idea of Rewind: encoded frames are continuously pushed into a
+//! time-bounded ring. It always holds roughly the last N seconds of gameplay,
+//! dropping the oldest packets as new ones arrive. Nothing touches the disk
+//! until the user asks to save, at which point [`ClipBuffer::snapshot`] hands the
+//! muxer a keyframe-aligned copy of the window.
 
-use std::path::PathBuf;
+use std::collections::VecDeque;
 
-/// A placeholder for an encoded frame / GOP chunk.
-///
-/// In the real implementation this holds compressed video data (e.g. an H.264
-/// NAL unit or a fragment) plus a presentation timestamp.
-#[derive(Debug, Default, Clone)]
-pub struct EncodedFrame {
-    pub timestamp_ns: u64,
-    pub data: Vec<u8>,
-}
+use crate::media::EncodedPacket;
 
-/// Fixed-capacity ring buffer of recently captured frames.
+const NS_PER_SEC: u64 = 1_000_000_000;
+
+/// Time-bounded ring of recently encoded packets.
 pub struct ClipBuffer {
-    frames: Vec<EncodedFrame>,
-    capacity: usize,
-    write_head: usize,
-    len: usize,
+    packets: VecDeque<EncodedPacket>,
+    window_ns: u64,
+    /// Hard safety cap on packet count, independent of the time window, so a
+    /// misbehaving timestamp source can't grow the buffer without bound.
+    max_packets: usize,
 }
 
 impl ClipBuffer {
-    /// Create a buffer sized to hold `seconds * fps` frames.
-    pub fn new(seconds: u32, fps: u32) -> Self {
-        let capacity = (seconds.max(1) * fps.max(1)) as usize;
+    /// Create a buffer holding roughly `window_seconds` of footage. `approx_fps`
+    /// is only used to size the safety cap and initial allocation.
+    pub fn new(window_seconds: u32, approx_fps: u32) -> Self {
+        let window_ns = window_seconds.max(1) as u64 * NS_PER_SEC;
+        // 2x headroom over the nominal frame count for encoder burstiness.
+        let max_packets = (window_seconds.max(1) * approx_fps.max(1)).saturating_mul(2) as usize;
         Self {
-            frames: Vec::with_capacity(capacity),
-            capacity,
-            write_head: 0,
-            len: 0,
+            packets: VecDeque::with_capacity(max_packets.min(8192)),
+            window_ns,
+            max_packets: max_packets.max(64),
         }
     }
 
-    /// Maximum number of frames the buffer holds before overwriting the oldest.
-    pub fn capacity(&self) -> usize {
-        self.capacity
+    /// Length of the rolling window in whole seconds.
+    pub fn window_seconds(&self) -> u32 {
+        (self.window_ns / NS_PER_SEC) as u32
     }
 
-    /// Number of frames currently buffered.
+    /// Number of packets currently buffered.
     pub fn len(&self) -> usize {
-        self.len
+        self.packets.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.packets.is_empty()
     }
 
-    /// Push an encoded frame, overwriting the oldest once full.
-    pub fn push(&mut self, frame: EncodedFrame) {
-        if self.frames.len() < self.capacity {
-            self.frames.push(frame);
-        } else {
-            self.frames[self.write_head] = frame;
+    /// Push an encoded packet, then evict anything older than the window.
+    pub fn push(&mut self, packet: EncodedPacket) {
+        self.packets.push_back(packet);
+        self.evict();
+    }
+
+    fn evict(&mut self) {
+        let Some(newest) = self.packets.back().map(|p| p.pts_ns) else {
+            return;
+        };
+        while self.packets.len() > 1 {
+            let too_old = self
+                .packets
+                .front()
+                .map(|p| newest.saturating_sub(p.pts_ns) > self.window_ns)
+                .unwrap_or(false);
+            let too_many = self.packets.len() > self.max_packets;
+            if too_old || too_many {
+                self.packets.pop_front();
+            } else {
+                break;
+            }
         }
-        self.write_head = (self.write_head + 1) % self.capacity;
-        self.len = (self.len + 1).min(self.capacity);
     }
 
-    /// Convenience used by the scaffold's stub entry point.
-    pub fn push_frame_placeholder(&mut self) {
-        self.push(EncodedFrame::default());
+    /// Span between the oldest and newest buffered packet, in nanoseconds.
+    pub fn buffered_duration_ns(&self) -> u64 {
+        match (self.packets.front(), self.packets.back()) {
+            (Some(f), Some(b)) => b.pts_ns.saturating_sub(f.pts_ns),
+            _ => 0,
+        }
     }
 
-    /// Flush the buffered frames to a clip file and return the output path.
-    ///
-    /// TODO: mux the buffered frames into an `.mp4`/`.mkv` container. For now this
-    /// just reports where the clip *would* be written.
-    pub fn flush_to_clip(&self, output_dir: &PathBuf) -> Result<String, String> {
-        // A real implementation would order frames from `write_head`, mux them,
-        // and write atomically. Timestamp-based naming is deferred to config/clock.
-        let path = output_dir.join("clip_latest.mp4");
-        Ok(path.display().to_string())
+    /// Copy the buffered window, trimmed to begin at the earliest keyframe so the
+    /// muxed clip is independently decodable from its first frame.
+    pub fn snapshot(&self) -> Vec<EncodedPacket> {
+        let start = self
+            .packets
+            .iter()
+            .position(|p| p.is_keyframe)
+            .unwrap_or(0);
+        self.packets.iter().skip(start).cloned().collect()
+    }
+
+    pub fn clear(&mut self) {
+        self.packets.clear();
     }
 }
 
@@ -83,14 +102,35 @@ impl ClipBuffer {
 mod tests {
     use super::*;
 
-    #[test]
-    fn ring_buffer_overwrites_oldest_when_full() {
-        let mut b = ClipBuffer::new(1, 3); // capacity 3
-        assert_eq!(b.capacity(), 3);
-        for _ in 0..5 {
-            b.push(EncodedFrame::default());
+    fn packet(pts_ms: u64, key: bool) -> EncodedPacket {
+        EncodedPacket {
+            data: vec![0u8; 16],
+            pts_ns: pts_ms * 1_000_000,
+            dts_ns: None,
+            is_keyframe: key,
         }
-        // Never exceeds capacity.
-        assert_eq!(b.len(), 3);
+    }
+
+    #[test]
+    fn evicts_packets_older_than_window() {
+        let mut b = ClipBuffer::new(1, 30); // 1 second window
+        for i in 0..200u64 {
+            // A frame every 10 ms => 2 s of footage total, only ~1 s should remain.
+            b.push(packet(i * 10, i % 30 == 0));
+        }
+        assert!(b.buffered_duration_ns() <= 1_000_000_000);
+        assert!(!b.is_empty());
+    }
+
+    #[test]
+    fn snapshot_starts_on_keyframe() {
+        let mut b = ClipBuffer::new(10, 30);
+        b.push(packet(0, false));
+        b.push(packet(10, false));
+        b.push(packet(20, true));
+        b.push(packet(30, false));
+        let snap = b.snapshot();
+        assert_eq!(snap.len(), 2);
+        assert!(snap[0].is_keyframe);
     }
 }

@@ -15,15 +15,48 @@ path = "src/main.rs"
 
 [features]
 default = []
-# Native Linux GUI (GTK4 + libadwaita). Requires the GTK4 + libadwaita dev
-# libraries and pkg-config on the build host (Linux). Kept out of the default
-# build so the core scaffold + ring buffer compile anywhere without system deps.
+
+# Convenience: the whole native Linux app.
+linux = ["gui", "capture-wayland", "capture-x11", "encode-gstreamer", "hotkey"]
+
+# Native GUI (GTK4 + libadwaita). Needs GTK4 + libadwaita dev libs + pkg-config.
 gui = ["dep:gtk4", "dep:libadwaita"]
 
+# Wayland capture via xdg-desktop-portal ScreenCast + PipeWire.
+capture-wayland = ["dep:ashpd", "dep:pipewire", "dep:pollster", "dep:libc"]
+
+# X11 capture via XShm / XComposite.
+capture-x11 = ["dep:x11rb"]
+
+# Hardware encode + mux via GStreamer (VA-API / NVENC / x264).
+encode-gstreamer = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video"]
+
+# Global hotkey via portal GlobalShortcuts, with an evdev fallback.
+hotkey = ["dep:ashpd", "dep:pollster", "dep:evdev"]
+
 [dependencies]
-# GUI stack — pulled in only with `--features gui`.
+# --- GUI (feature `gui`) ---
 gtk4 = { version = "0.9", optional = true }
 libadwaita = { version = "0.7", optional = true, features = ["v1_4"] }
+
+# --- Wayland capture (feature `capture-wayland`) ---
+ashpd = { version = "0.9", optional = true }
+pipewire = { version = "0.8", optional = true }
+libc = { version = "0.2", optional = true }
+
+# --- X11 capture (feature `capture-x11`) ---
+x11rb = { version = "0.13", optional = true, features = ["shm", "composite"] }
+
+# --- Encode/mux (feature `encode-gstreamer`) ---
+gstreamer = { version = "0.23", optional = true }
+gstreamer-app = { version = "0.23", optional = true }
+gstreamer-video = { version = "0.23", optional = true }
+
+# --- Hotkey (feature `hotkey`) ---
+evdev = { version = "0.12", optional = true }
+
+# --- Shared async glue for portal (ashpd) calls ---
+pollster = { version = "0.3", optional = true }
 
 [profile.release]
 # Favor a small, low-overhead binary — this tool runs alongside games.

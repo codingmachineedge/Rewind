@@ -85,20 +85,36 @@ system libraries. The `main.rs` CLI path remains as a headless fallback.
 
 ## Modules
 
-| File             | Responsibility                                            |
-|------------------|-----------------------------------------------------------|
-| `src/main.rs`    | Entry point; launches the GUI (feature `gui`) or CLI stub.|
-| `src/gui.rs`     | GTK4 + libadwaita control window (feature `gui`).         |
-| `src/buffer.rs`  | `ClipBuffer` ring buffer + `EncodedFrame` (implemented).  |
-| `src/config.rs`  | Runtime configuration and local-first defaults.           |
+| File                       | Feature            | Responsibility                                                        |
+|----------------------------|--------------------|----------------------------------------------------------------------|
+| `src/main.rs`              | —                  | Entry point; launches the GUI (`gui`) or a headless CLI runner.       |
+| `src/media.rs`             | —                  | Shared types: `Frame`, `PixelFormat`, `StreamInfo`, `EncodedPacket`.  |
+| `src/config.rs`            | —                  | Runtime config, local-first defaults, encode settings, clip naming.   |
+| `src/buffer.rs`            | —                  | `ClipBuffer` — time-bounded ring of encoded packets, keyframe snapshot.|
+| `src/pipeline.rs`          | —                  | Orchestrator: capture → encode worker → buffer → save; hotkey wiring. |
+| `src/capture/mod.rs`       | —                  | `FrameSource` trait + `$XDG_SESSION_TYPE` backend selector.           |
+| `src/capture/wayland.rs`   | `capture-wayland`  | PipeWire + xdg-desktop-portal ScreenCast, with `restore_token`.       |
+| `src/capture/x11.rs`       | `capture-x11`      | XShm root-window capture.                                             |
+| `src/encode/mod.rs`        | —                  | `Encoder` + `Muxer` traits and backend selectors.                    |
+| `src/encode/gstreamer.rs`  | `encode-gstreamer` | GStreamer hw encode (VA-API/NVENC/x264) + MP4/MKV mux.               |
+| `src/hotkey/mod.rs`        | —                  | `HotkeyManager` trait + selector.                                    |
+| `src/hotkey/portal.rs`     | `hotkey`           | Portal GlobalShortcuts, with an evdev fallback.                      |
+| `src/gui.rs`               | `gui`              | GTK4 + libadwaita window wired to the live `Pipeline`.               |
+
+The core (everything with no feature) is std-only and compiles on any host; when
+a backend feature is off, its selector returns an "unsupported" error/`None` and
+the pipeline degrades gracefully, so the default build stays green.
 
 ## Roadmap
 
-- [ ] `FrameSource` trait with Wayland (PipeWire/portal) + X11 backends
-- [ ] Portal `restore_token` persistence (no re-prompt on relaunch)
-- [ ] Hardware encoder integration (GStreamer / VA-API / NVENC)
-- [ ] Global hotkey registration (works under Wayland input constraints)
-- [ ] MP4/MKV muxing on flush
+- [x] `FrameSource` trait with Wayland (PipeWire/portal) + X11 backends
+- [x] Portal `restore_token` persistence (no re-prompt on relaunch)
+- [x] Hardware encoder integration (GStreamer / VA-API / NVENC / x264)
+- [x] Global hotkey registration (portal GlobalShortcuts + evdev fallback)
+- [x] MP4/MKV muxing on flush (keyframe-aligned from the ring buffer)
+- [x] Continuous encode into a time-bounded ring buffer
+- [x] GUI wired to the live pipeline (start/stop, save, settings, status)
+- [ ] DMABUF fast path for zero-copy Wayland frames
 - [ ] TOML config loading + first-run setup (persist GUI settings)
-- [ ] Wire the GUI toggle to the real capture thread
 - [ ] Tray icon / background daemon mode
+- [ ] Compile-verify the Linux backends in CI on a real Linux runner

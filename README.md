@@ -29,24 +29,43 @@ Rewind builds on the standard Linux screen-capture pipeline rather than reinvent
 - **GUI:** **GTK4 + libadwaita** (via `gtk4-rs`), for a native GNOME/Linux look and feel.
 - Conceptually similar to an OBS replay buffer, but headless-capable, single-purpose, and lightweight.
 
+## Requirements
+
+Rewind will **not** require nuclear power, a spare GPU farm, or a slice of chocolate cake to run. 🍰⚡ It's a lightweight little thing — Rust, a screen, and your existing desktop are all it asks for. No absurd dependencies, no ritual sacrifices.
+
 ## Status
 
-🚧 Early scaffold. The ring buffer and a wired-up GUI are in place; the capture/encode pipeline is stubbed — see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the design and the [wiki](../../wiki) for guides.
+🚧 Under construction, but real. The full pipeline is implemented — a `FrameSource` capture abstraction (Wayland via PipeWire/portal, X11 via XShm), continuous GStreamer hardware encode into a time-bounded ring buffer, keyframe-aligned save-to-clip, and a GTK4 GUI wired to the live pipeline. The Linux backends build behind cargo features; see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and the [wiki](../../wiki).
 
 ## Building
 
-Requires [Rust](https://rustup.rs/) (stable) on Linux.
+Requires [Rust](https://rustup.rs/) (stable). The headless core builds anywhere; the Linux backends need their system libraries.
 
 ```sh
-# Headless core (no system deps) — builds anywhere:
+# Headless core (no system deps) — builds on any platform:
 cargo build
 cargo run
 
-# Native GUI (needs GTK4 + libadwaita dev libraries + pkg-config on Linux):
-cargo run --features gui
+# The full native Linux app (GUI + capture + encode + hotkeys):
+cargo run --features linux
+
+# Or pick individual slices:
+cargo run --features gui                 # just the GTK window
+cargo build --features capture-wayland   # Wayland/PipeWire capture
+cargo build --features encode-gstreamer  # GStreamer encode/mux
 ```
 
-On Debian/Ubuntu the GUI build needs `libgtk-4-dev` and `libadwaita-1-dev`; on Fedora `gtk4-devel` and `libadwaita-devel`. Runtime capture will additionally depend on your session providing PipeWire + a desktop portal (Wayland) or an X11 server — see the wiki's **Getting Started** page.
+**System packages** for `--features linux` (Debian/Ubuntu):
+
+```sh
+sudo apt install libgtk-4-dev libadwaita-1-dev \
+  libpipewire-0.3-dev pkg-config \
+  libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+  gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-vaapi \
+  libxcb-shm0-dev libxcb-composite0-dev libevdev-dev
+```
+
+On Fedora the equivalents are `gtk4-devel`, `libadwaita-devel`, `pipewire-devel`, `gstreamer1-devel`, `gstreamer1-plugins-{good,bad-free}`, etc. Runtime capture also needs your session to provide PipeWire + a desktop portal (Wayland) or an X11 server — see the wiki's **Getting Started** page.
 
 ## Contributing
 
