@@ -8,11 +8,9 @@
 //! * **XShm** (fast, zero socket copy): the server writes the captured image
 //!   straight into a POSIX shared-memory segment this process maps. Attaching a
 //!   SysV shm segment requires the libc `shmget`/`shmat`/`shmctl`/`shmdt` calls,
-//!   which `x11rb` intentionally does not wrap. Because the `libc` crate is only
-//!   pulled in by the `capture-wayland` feature in this workspace (it is not a
-//!   dependency of `capture-x11` alone), the SHM path is compiled **only when
-//!   `libc` is also available** (`#[cfg(feature = "capture-wayland")]`). See the
-//!   NOTE below — enabling SHM for a pure X11 build is a one-line Cargo change.
+//!   which `x11rb` intentionally does not wrap. The `capture-x11` feature pulls in
+//!   the `libc` crate for exactly this purpose, so the SHM fast path is compiled
+//!   whenever this module is (`#[cfg(feature = "capture-x11")]`).
 //! * **`xproto::get_image`** (portable fallback): pixels travel back inside the
 //!   reply over the X socket. Always compiled; correct everywhere, just slower.
 //!
@@ -132,7 +130,7 @@ pub fn open() -> Result<Box<dyn FrameSource>, CaptureError> {
 
 /// Whether the MIT-SHM fast path is usable: the code must be compiled in (libc
 /// present) *and* the running server must advertise the extension.
-#[cfg(feature = "capture-wayland")]
+#[cfg(feature = "capture-x11")]
 fn shm_available(conn: &RustConnection) -> bool {
     use x11rb::protocol::shm::ConnectionExt as _;
     // NOTE: `shm_query_version` is the canonical presence check; it errors if the
@@ -144,7 +142,7 @@ fn shm_available(conn: &RustConnection) -> bool {
 }
 
 /// SHM path not compiled (no libc under a pure `capture-x11` build).
-#[cfg(not(feature = "capture-wayland"))]
+#[cfg(not(feature = "capture-x11"))]
 fn shm_available(_conn: &RustConnection) -> bool {
     false
 }
@@ -289,7 +287,7 @@ fn capture_loop(
     let frame_interval = Duration::from_secs_f64(1.0 / info.framerate.max(1) as f64);
 
     // Set up the SHM grabber once if available; on any setup failure fall back.
-    #[cfg(feature = "capture-wayland")]
+    #[cfg(feature = "capture-x11")]
     let mut shm = if has_shm {
         match shm_impl::ShmGrabber::new(conn, frame_bytes) {
             Ok(g) => Some(g),
@@ -301,7 +299,7 @@ fn capture_loop(
     } else {
         None
     };
-    #[cfg(not(feature = "capture-wayland"))]
+    #[cfg(not(feature = "capture-x11"))]
     let _ = has_shm;
 
     while running.load(Ordering::SeqCst) {
@@ -310,7 +308,7 @@ fn capture_loop(
         // Grab into an owned Vec<u8> in ZPixmap order.
         let mut buf: Vec<u8>;
 
-        #[cfg(feature = "capture-wayland")]
+        #[cfg(feature = "capture-x11")]
         {
             if let Some(g) = shm.as_mut() {
                 buf = g.grab(conn, root, width, height, frame_bytes)?;
@@ -318,7 +316,7 @@ fn capture_loop(
                 buf = grab_wire(conn, root, width, height)?;
             }
         }
-        #[cfg(not(feature = "capture-wayland"))]
+        #[cfg(not(feature = "capture-x11"))]
         {
             buf = grab_wire(conn, root, width, height)?;
         }
@@ -354,7 +352,7 @@ fn capture_loop(
 
     // Detach the SHM segment on the server side while the connection is still
     // alive, then let the grabber's Drop unmap the local mapping.
-    #[cfg(feature = "capture-wayland")]
+    #[cfg(feature = "capture-x11")]
     if let Some(mut g) = shm.take() {
         g.detach(conn);
     }
@@ -384,10 +382,9 @@ fn grab_wire(
     Ok(reply.data)
 }
 
-/// MIT-SHM fast path. Compiled only when `libc` is available in the build (see
-/// the module docs); guarded behind the `capture-wayland` feature which is the
-/// crate's sole source of `dep:libc`.
-#[cfg(feature = "capture-wayland")]
+/// MIT-SHM fast path. `capture-x11` pulls in `dep:libc` for the SysV shm calls,
+/// so this is compiled whenever the module is.
+#[cfg(feature = "capture-x11")]
 mod shm_impl {
     use super::*;
     use x11rb::protocol::shm::{self, ConnectionExt as _};

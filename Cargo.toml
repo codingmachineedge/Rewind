@@ -26,7 +26,7 @@ gui = ["dep:gtk4", "dep:libadwaita"]
 capture-wayland = ["dep:ashpd", "dep:pipewire", "dep:pollster", "dep:libc"]
 
 # X11 capture via XShm / XComposite.
-capture-x11 = ["dep:x11rb"]
+capture-x11 = ["dep:x11rb", "dep:libc"]
 
 # Hardware encode + mux via GStreamer (VA-API / NVENC / x264).
 encode-gstreamer = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video"]
