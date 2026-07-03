@@ -1,0 +1,53 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    # Pin to ubuntu-24.04 (NOT ubuntu-latest) so the produced binary links
+    # against Ubuntu 24.04's glibc, matching what install.sh promises users.
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libgtk-4-dev \
+            libadwaita-1-dev \
+            libpipewire-0.3-dev \
+            libspa-0.2-dev \
+            libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev \
+            libxcb1-dev \
+            libxcb-shm0-dev \
+            libxcb-composite0-dev \
+            libevdev-dev \
+            libclang-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build --release --features linux
+
+      - name: Package tarball
+        run: |
+          cp target/release/rewind rewind
+          tar -czf rewind-x86_64-linux-gnu.tar.gz rewind README.md LICENSE
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: rewind-x86_64-linux-gnu.tar.gz
+          generate_release_notes: true

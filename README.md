@@ -44,6 +44,14 @@ Rewind will **not** require nuclear power, a spare GPU farm, or a slice of choco
 
 Verified on a real Ubuntu 24.04 GNOME/Xorg session (software x264 encode): a 6-second capture produced a valid **H.264 + AAC** MP4 (correct duration, both streams) and an auto-converted shareable copy that plays. Hardware encode (VA-API/NVENC) is wired but needs a real GPU to exercise. The Linux backends build behind cargo features; see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and the [wiki](../../wiki).
 
+## Install (Linux, one line)
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/codingmachineedge/Rewind/master/install.sh | bash
+```
+
+Downloads the latest [release](https://github.com/codingmachineedge/Rewind/releases) binary to `~/.local/bin/rewind` (or `/usr/local/bin` as root; override with `REWIND_INSTALL_DIR`). The binary is built on Ubuntu 24.04 — on other distros or older glibc, build from source below. Set `REWIND_INSTALL_DEPS=1` to let it apt-install the GStreamer/GTK runtime packages automatically.
+
 ## Building
 
 Requires [Rust](https://rustup.rs/) (stable). The headless core builds anywhere; the Linux backends need their system libraries.
