@@ -635,11 +635,18 @@ impl Muxer for GstMuxer {
             .set_state(gst::State::Playing)
             .map_err(|e| backend("set mux pipeline Playing", e))?;
 
-        push_packets(&vsrc, video)?;
+        // Video and audio are captured on different clocks (rebased-monotonic vs
+        // the live audio source's running-time). Rebase each track to its own 0
+        // origin so the container has sane, aligned timestamps and a correct
+        // duration — a mismatch here yields a bogus duration and a moov that some
+        // demuxers reject.
+        let vbase = video.iter().map(|p| p.pts_ns).min().unwrap_or(0);
+        push_packets(&vsrc, video, vbase)?;
         vsrc.end_of_stream()
             .map_err(|e| backend("video eos", e))?;
         if let Some(asrc) = &asrc {
-            push_packets(asrc, audio)?;
+            let abase = audio.iter().map(|p| p.pts_ns).min().unwrap_or(0);
+            push_packets(asrc, audio, abase)?;
             asrc.end_of_stream().map_err(|e| backend("audio eos", e))?;
         }
 
@@ -647,18 +654,24 @@ impl Muxer for GstMuxer {
     }
 }
 
-/// Push encoded packets into an appsrc as timestamped buffers.
-fn push_packets(src: &gst_app::AppSrc, packets: &[EncodedPacket]) -> Result<(), EncodeError> {
+/// Push encoded packets into an appsrc as timestamped buffers, rebasing every
+/// timestamp so the track starts at 0 (`base_ns` is subtracted).
+fn push_packets(
+    src: &gst_app::AppSrc,
+    packets: &[EncodedPacket],
+    base_ns: u64,
+) -> Result<(), EncodeError> {
     for pkt in packets {
         let mut buffer = gst::Buffer::from_slice(pkt.data.clone());
         {
             let buf = buffer
                 .get_mut()
                 .ok_or_else(|| EncodeError::Backend("fresh mux buffer shared".into()))?;
-            buf.set_pts(gst::ClockTime::from_nseconds(pkt.pts_ns));
+            let pts = pkt.pts_ns.saturating_sub(base_ns);
+            buf.set_pts(gst::ClockTime::from_nseconds(pts));
             // mp4mux needs a DTS; fall back to PTS when the encoder didn't set
             // one (our streams have no B-frames, so DTS == PTS).
-            let dts = pkt.dts_ns.unwrap_or(pkt.pts_ns);
+            let dts = pkt.dts_ns.unwrap_or(pkt.pts_ns).saturating_sub(base_ns);
             buf.set_dts(gst::ClockTime::from_nseconds(dts));
             if !pkt.is_keyframe {
                 buf.set_flags(gst::BufferFlags::DELTA_UNIT);
