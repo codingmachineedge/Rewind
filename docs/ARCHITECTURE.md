@@ -113,8 +113,23 @@ the pipeline degrades gracefully, so the default build stays green.
 - [x] Global hotkey registration (portal GlobalShortcuts + evdev fallback)
 - [x] MP4/MKV muxing on flush (keyframe-aligned from the ring buffer)
 - [x] Continuous encode into a time-bounded ring buffer
+- [x] Audio capture (PipeWire) muxed as a second track, A/V aligned
+- [x] Auto-convert saved clips to a shareable H.264/AAC MP4 (faststart)
 - [x] GUI wired to the live pipeline (start/stop, save, settings, status)
+- [x] Runtime-verified end-to-end in a real Ubuntu GNOME session (X11 + audio)
+- [ ] Verify the Wayland portal ScreenCast path end-to-end (needs the grant dialog)
+- [ ] Verify hardware encode on a real GPU (VA-API/NVENC)
 - [ ] DMABUF fast path for zero-copy Wayland frames
 - [ ] TOML config loading + first-run setup (persist GUI settings)
 - [ ] Tray icon / background daemon mode
-- [ ] Compile-verify the Linux backends in CI on a real Linux runner
+
+## Audio & A/V timing
+
+Audio is captured inside the same GStreamer graph as video (`pulsesrc` from the
+default sink's monitor → `audioconvert` → `audioresample` → AAC/Opus → parser →
+appsink), producing `Track::Audio`-tagged packets that flow into a parallel ring
+buffer. Video frames are stamped with an explicit, monotonic, 0-based PTS; audio
+uses the live source's running-time. On save, the muxer **rebases each track to
+its own 0 origin** before muxing, which keeps the container duration correct and
+the moov well-formed (a mismatch here produces a bogus multi-hour duration and a
+file some demuxers reject). Both tracks then start at 0 and stay aligned.

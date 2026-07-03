@@ -12,12 +12,14 @@ Linux gamers have never had a great "instant replay" tool. The mainstream option
 
 - **Background buffer capture** — continuously encode gameplay into a fixed-size ring buffer (configurable duration).
 - **Save-last-N-seconds hotkey** — press a global hotkey to instantly flush the buffer to an `.mp4`/`.mkv` clip.
+- **Audio too** — captures system/game audio via PipeWire and muxes it alongside the video, A/V aligned.
+- **Auto-convert to shareable** — after each save, transcodes the clip to a standard H.264/AAC MP4 (faststart) in the background.
 - **Low overhead** — hardware-accelerated capture and GPU (VA-API / NVENC) encoding to minimize FPS impact.
 - **No telemetry, no account** — nothing is uploaded, nothing is tracked, no login required.
 - **Local-first** — clips are written straight to a folder you choose; you own your data.
 - **Wayland *and* X11** — first-class support for the modern Linux desktop, with a fallback for legacy sessions.
 - **Native GUI** — a small GTK4 + libadwaita control window (start/stop, save, settings), plus a headless mode.
-- **Configurable** — buffer length, output quality, hotkey, and save location via a simple config file.
+- **Configurable** — buffer length, output quality, hotkey, audio, and save location.
 
 ## Linux capture stack
 
@@ -26,6 +28,8 @@ Rewind builds on the standard Linux screen-capture pipeline rather than reinvent
 - **Wayland:** capture via the **PipeWire** + **xdg-desktop-portal** `ScreenCast` API (the same mechanism OBS and `wf-recorder` use). This is the sanctioned, compositor-agnostic path and works under wlroots (Sway, Hyprland), GNOME, and KDE.
 - **X11:** capture via XComposite / XShm (or PipeWire where available) for legacy sessions.
 - **Encode/mux:** a **GStreamer** pipeline (or direct VA-API / NVENC) handles hardware-accelerated H.264/HEVC encoding and muxing into `.mp4`/`.mkv`.
+- **Audio:** captured via PipeWire (`pulsesrc`) from the default sink's monitor, encoded to AAC/Opus, and muxed as a second track in the same GStreamer graph.
+- **Share:** a post-save `decodebin → x264enc + AAC → mp4mux(faststart)` transcode produces a universally-playable copy.
 - **GUI:** **GTK4 + libadwaita** (via `gtk4-rs`), for a native GNOME/Linux look and feel.
 - Conceptually similar to an OBS replay buffer, but headless-capable, single-purpose, and lightweight.
 
@@ -35,7 +39,9 @@ Rewind will **not** require nuclear power, a spare GPU farm, or a slice of choco
 
 ## Status
 
-🚧 Under construction, but real. The full pipeline is implemented — a `FrameSource` capture abstraction (Wayland via PipeWire/portal, X11 via XShm), continuous GStreamer hardware encode into a time-bounded ring buffer, keyframe-aligned save-to-clip, and a GTK4 GUI wired to the live pipeline. The Linux backends build behind cargo features; see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and the [wiki](../../wiki).
+🚧 Under construction, but **real and runtime-verified**. The full pipeline works end-to-end: a `FrameSource` capture abstraction (Wayland via PipeWire/portal, X11 via XShm), continuous GStreamer encode into a time-bounded ring buffer, **PipeWire audio** muxed alongside, keyframe-aligned save-to-clip, **auto-convert** to a shareable MP4, an **evdev/portal global hotkey**, and a GTK4 GUI wired to the live pipeline.
+
+Verified on a real Ubuntu 24.04 GNOME/Xorg session (software x264 encode): a 6-second capture produced a valid **H.264 + AAC** MP4 (correct duration, both streams) and an auto-converted shareable copy that plays. Hardware encode (VA-API/NVENC) is wired but needs a real GPU to exercise. The Linux backends build behind cargo features; see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and the [wiki](../../wiki).
 
 ## Building
 
