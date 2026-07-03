@@ -1,7 +1,9 @@
 //! ClipForge — lightweight, privacy-respecting game clip recorder.
 //!
-//! This is an early scaffold. The real capture pipeline (Windows.Graphics.Capture
-//! -> encoder -> ring buffer) is stubbed out; see `docs/ARCHITECTURE.md`.
+//! Target platform: Linux (Wayland via PipeWire/portal, and X11).
+//!
+//! This is an early scaffold. The real capture pipeline (PipeWire/portal screen
+//! capture -> encoder -> ring buffer) is stubbed out; see `docs/ARCHITECTURE.md`.
 
 mod buffer;
 mod config;
@@ -29,7 +31,7 @@ fn main() {
     // TODO: start the capture thread that pushes frames into `clip_buffer`,
     // and register the global hotkey that calls `clip_buffer.flush_to_clip()`.
     println!("[stub] Capture pipeline not yet implemented — see docs/ARCHITECTURE.md.");
-    println!("[stub] Would begin buffering the active display/window now.");
+    println!("[stub] Would open a PipeWire/portal ScreenCast (Wayland) or X11 capture and begin buffering.");
 
     // Demonstrate the buffer API so the skeleton is exercised and buildable.
     clip_buffer.push_frame_placeholder();

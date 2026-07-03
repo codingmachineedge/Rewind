@@ -4,6 +4,8 @@ This document sketches the intended design of ClipForge. It describes the
 target pipeline; the current codebase is an early scaffold with the buffer API
 implemented and the capture/encode stages stubbed.
 
+**Target platform: Linux** (Wayland and X11 desktop sessions).
+
 ## Design goals
 
 1. **Low overhead** — must not meaningfully cost the user frames while gaming.
@@ -17,33 +19,60 @@ implemented and the capture/encode stages stubbed.
 ## Pipeline overview
 
 ```
-+-----------------+     +--------------+     +------------------+     +-----------+
-|  Frame Capture  | --> |   Encoder    | --> |   Ring Buffer    | --> | Clip Muxer|
-| (WGC / DXGI)    |     | (HW H.264)   |     | (last N seconds) |     | (.mp4)    |
-+-----------------+     +--------------+     +------------------+     +-----------+
-        |                                            ^                      ^
-        |                                            |                      |
-     capture thread                          global hotkey ----------------+
++---------------------+     +--------------+     +------------------+     +-----------+
+|   Frame Capture     | --> |   Encoder    | --> |   Ring Buffer    | --> | Clip Muxer|
+| PipeWire/portal(WL) |     | (VA-API /    |     | (last N seconds) |     | (.mp4/    |
+| XComposite/XShm(X11)|     |  NVENC/GST)  |     |                  |     |  .mkv)    |
++---------------------+     +--------------+     +------------------+     +-----------+
+        |                                               ^                      ^
+        |                                               |                      |
+     capture thread                             global hotkey ----------------+
 ```
 
-### 1. Frame capture
-Use the **Windows.Graphics.Capture (WGC)** API (fallback: DXGI Desktop
-Duplication) to grab frames from the active display or a specific game window
-with minimal copies. Runs on a dedicated capture thread.
+## Wayland vs X11 capture
 
-### 2. Encoder
-Feed captured surfaces to a hardware H.264/HEVC encoder (Media Foundation, or
-NVENC/AMF/QuickSync where available). Encoding in real time keeps the buffer
-compact so seconds of footage fit comfortably in RAM.
+Linux has no single screen-capture API — the right path depends on the session:
 
-### 3. Ring buffer (`src/buffer.rs`)
+### Wayland (preferred)
+Wayland compositors deliberately deny arbitrary screen access. The sanctioned
+route is the **`org.freedesktop.portal.ScreenCast`** interface of
+**xdg-desktop-portal**, which hands back a **PipeWire** stream after the user
+grants permission. This is the same mechanism OBS Studio and `wf-recorder` use,
+and it works across wlroots (Sway, Hyprland), GNOME (Mutter), and KDE (KWin).
+
+- Pros: compositor-agnostic, user-consented, zero-copy DMA-BUF frames.
+- Considerations: capture requires an interactive permission grant; a
+  `restore_token` is persisted so re-launches don't re-prompt. GNOME vs wlroots
+  portals differ slightly in cursor/region options.
+- Crates: `ashpd` (portal), `pipewire` (stream).
+
+### X11 (legacy fallback)
+For X11 sessions, capture directly with **XComposite + XShm** (shared-memory
+image transfer) or use PipeWire where the portal is available. X11 imposes no
+permission prompt, but offers no DMA-BUF fast path, so this is the higher-overhead
+path.
+
+- Crates: `x11rb` (or `xcb`).
+
+The capture layer is abstracted behind a `FrameSource` trait so `main` is
+agnostic to which backend (Wayland/PipeWire or X11) is active; selection happens
+at runtime from `$XDG_SESSION_TYPE`.
+
+## Encoder & muxer
+
+A **GStreamer** pipeline handles hardware-accelerated H.264/HEVC encoding
+(`vaapih264enc` / `nvh264enc`) and muxing into `.mp4`/`.mkv`. GStreamer also
+bridges cleanly to the PipeWire source (`pipewiresrc`), keeping the whole path in
+one framework where possible. Direct VA-API/NVENC remain an option for the
+lowest-overhead builds.
+
+## Ring buffer (`src/buffer.rs`)
+
 A fixed-capacity ring of encoded frames sized to `buffer_seconds * target_fps`.
 The oldest frame is overwritten once full — memory usage is bounded and
-predictable. **This is the piece implemented today.**
-
-### 4. Clip muxer
-On the save hotkey, the buffered frames (ordered from the write head) are muxed
-into an `.mp4`/`.mkv` and written atomically to the user's output directory.
+predictable. On the save hotkey, the buffered frames (ordered from the write
+head) are muxed and written atomically to the user's output directory.
+**This is the piece implemented today.**
 
 ## Modules
 
@@ -55,9 +84,10 @@ into an `.mp4`/`.mkv` and written atomically to the user's output directory.
 
 ## Roadmap
 
-- [ ] WGC capture thread feeding real frames into the buffer
-- [ ] Hardware encoder integration
-- [ ] Global hotkey registration
-- [ ] MP4 muxing on flush
+- [ ] `FrameSource` trait with Wayland (PipeWire/portal) + X11 backends
+- [ ] Portal `restore_token` persistence (no re-prompt on relaunch)
+- [ ] Hardware encoder integration (GStreamer / VA-API / NVENC)
+- [ ] Global hotkey registration (works under Wayland input constraints)
+- [ ] MP4/MKV muxing on flush
 - [ ] TOML config loading + first-run setup
 - [ ] Tray UI / minimal control surface
