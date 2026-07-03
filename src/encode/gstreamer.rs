@@ -178,6 +178,9 @@ struct EncoderInner {
     appsink: gst_app::AppSink,
     appsink_audio: Option<gst_app::AppSink>,
     eos_sent: bool,
+    /// First video frame's monotonic pts, so we can rebase video to a 0-based
+    /// timeline (the audio branch is already ~0-based on pipeline running-time).
+    base_pts: Option<u64>,
 }
 
 impl GstEncoder {
@@ -212,9 +215,9 @@ impl Encoder for GstEncoder {
             .is_live(true)
             .format(gst::Format::Time)
             .build();
-        // Stamp buffers with pipeline running-time on arrival, so video shares a
-        // clock with the live audio source and the two stay in sync.
-        appsrc.set_do_timestamp(true);
+        // We set an explicit, rebased PTS on each frame in `push_frame` (see
+        // `base_pts`), so do NOT let appsrc overwrite it with arrival time.
+        appsrc.set_do_timestamp(false);
 
         let videoconvert = gst::ElementFactory::make("videoconvert")
             .build()
@@ -296,6 +299,7 @@ impl Encoder for GstEncoder {
             appsink,
             appsink_audio,
             eos_sent: false,
+            base_pts: None,
         });
         Ok(())
     }
@@ -305,8 +309,17 @@ impl Encoder for GstEncoder {
         let inner = guard
             .as_mut()
             .ok_or_else(|| EncodeError::Backend("push_frame before configure".into()))?;
-        // do-timestamp stamps PTS on arrival; just hand over the pixels.
-        let buffer = gst::Buffer::from_slice(frame.data.as_slice().to_vec());
+        // Rebase to a 0-based timeline off the first frame, and set an explicit
+        // PTS so the muxer always has valid timestamps.
+        let base = *inner.base_pts.get_or_insert(frame.pts_ns);
+        let rel = frame.pts_ns.saturating_sub(base);
+        let mut buffer = gst::Buffer::from_slice(frame.data.as_slice().to_vec());
+        {
+            let buf = buffer
+                .get_mut()
+                .ok_or_else(|| EncodeError::Backend("fresh frame buffer shared".into()))?;
+            buf.set_pts(gst::ClockTime::from_nseconds(rel));
+        }
         inner
             .appsrc
             .push_buffer(buffer)
@@ -340,10 +353,13 @@ impl Encoder for GstEncoder {
             inner.eos_sent = true;
         }
 
-        let timeout = gst::ClockTime::from_mseconds(100);
-        drain(&inner.appsink, timeout, Track::Video, sink)?;
+        // Video: EOS propagates, so a timed drain ends when the sink returns None.
+        drain(&inner.appsink, gst::ClockTime::from_mseconds(100), Track::Video, sink)?;
+        // Audio: the source is LIVE and never sends EOS, so a timed drain would
+        // loop forever. Grab only the currently-queued backlog (non-blocking,
+        // bounded) before tearing down.
         if let Some(a) = &inner.appsink_audio {
-            drain(a, timeout, Track::Audio, sink)?;
+            drain_bounded(a, Track::Audio, sink, 4096)?;
         }
 
         inner
@@ -390,10 +406,11 @@ impl GstEncoder {
         let aenc = gst::ElementFactory::make(achoice.enc)
             .build()
             .map_err(|e| backend(&format!("make {}", achoice.enc), e))?;
-        // Audio bitrate props are in bits/sec; try u32 then i32.
+        // Audio bitrate props are in bits/sec. avenc_aac/opusenc declare it as
+        // `gint`, so try i32 first, then u32 for encoders that use guint.
         let abits = settings.audio_bitrate_kbps.saturating_mul(1000);
-        if !try_set_u32(&aenc, "bitrate", abits) {
-            let _ = try_set_i32(&aenc, "bitrate", abits as i32);
+        if !try_set_i32(&aenc, "bitrate", abits as i32) {
+            let _ = try_set_u32(&aenc, "bitrate", abits);
         }
 
         let aparse = match achoice.parse {
@@ -442,6 +459,27 @@ fn drain(
     while let Some(sample) = appsink.try_pull_sample(Some(timeout)) {
         if let Some(pkt) = sample_to_packet(&sample, track)? {
             sink(pkt);
+        }
+    }
+    Ok(())
+}
+
+/// Non-blocking drain of at most `max` currently-queued samples. Used for the
+/// live audio sink, which never sends EOS (a timed drain would never return).
+fn drain_bounded(
+    appsink: &gst_app::AppSink,
+    track: Track,
+    sink: &mut dyn FnMut(EncodedPacket),
+    max: usize,
+) -> Result<(), EncodeError> {
+    for _ in 0..max {
+        match appsink.try_pull_sample(Some(gst::ClockTime::ZERO)) {
+            Some(sample) => {
+                if let Some(pkt) = sample_to_packet(&sample, track)? {
+                    sink(pkt);
+                }
+            }
+            None => break,
         }
     }
     Ok(())
@@ -618,9 +656,10 @@ fn push_packets(src: &gst_app::AppSrc, packets: &[EncodedPacket]) -> Result<(), 
                 .get_mut()
                 .ok_or_else(|| EncodeError::Backend("fresh mux buffer shared".into()))?;
             buf.set_pts(gst::ClockTime::from_nseconds(pkt.pts_ns));
-            if let Some(dts) = pkt.dts_ns {
-                buf.set_dts(gst::ClockTime::from_nseconds(dts));
-            }
+            // mp4mux needs a DTS; fall back to PTS when the encoder didn't set
+            // one (our streams have no B-frames, so DTS == PTS).
+            let dts = pkt.dts_ns.unwrap_or(pkt.pts_ns);
+            buf.set_dts(gst::ClockTime::from_nseconds(dts));
             if !pkt.is_keyframe {
                 buf.set_flags(gst::BufferFlags::DELTA_UNIT);
             }
