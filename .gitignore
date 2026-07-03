@@ -1,0 +1,27 @@
+# Rust / Cargo
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Build & profiling artifacts
+*.pdb
+*.exe
+*.dll
+
+# Recorded clips / captured output (never commit user footage)
+/clips/
+*.mp4
+*.mkv
+
+# Local config & secrets
+config.local.toml
+.env
+
+# Editor / OS
+.vs/
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+.DS_Store

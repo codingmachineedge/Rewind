@@ -1,0 +1,27 @@
+[package]
+name = "clipforge"
+version = "0.1.0"
+edition = "2021"
+description = "Lightweight, privacy-respecting game clip recorder for Windows — a ShadowPlay / Xbox Game Bar alternative."
+license = "MIT"
+repository = "https://github.com/codingmachineedge/ClipForge"
+readme = "README.md"
+keywords = ["game", "capture", "recording", "shadowplay", "windows"]
+categories = ["multimedia::video", "command-line-utilities"]
+
+[[bin]]
+name = "clipforge"
+path = "src/main.rs"
+
+[dependencies]
+# Capture/encoding crates (windows-capture, windows, etc.) will be added as the
+# pipeline is implemented. Kept dependency-free for now so the scaffold builds
+# instantly on any stable toolchain.
+
+[profile.release]
+# Favor a small, low-overhead binary — this tool runs alongside games.
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
