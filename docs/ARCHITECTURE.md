@@ -1,6 +1,6 @@
-# ClipForge Architecture
+# Rewind Architecture
 
-This document sketches the intended design of ClipForge. It describes the
+This document sketches the intended design of Rewind. It describes the
 target pipeline; the current codebase is an early scaffold with the buffer API
 implemented and the capture/encode stages stubbed.
 
@@ -74,11 +74,21 @@ predictable. On the save hotkey, the buffered frames (ordered from the write
 head) are muxed and written atomically to the user's output directory.
 **This is the piece implemented today.**
 
+## User interface
+
+A native **GTK4 + libadwaita** GUI (`src/gui.rs`, via `gtk4-rs`) provides the
+control surface: a start/stop capture toggle, a "Save last N seconds" button, a
+settings group (buffer length, output folder, hotkey), and a status line — all
+wired to `Config` and `ClipBuffer`. It's gated behind the `gui` cargo feature
+(`cargo run --features gui`) so the headless core still builds without the GTK
+system libraries. The `main.rs` CLI path remains as a headless fallback.
+
 ## Modules
 
 | File             | Responsibility                                            |
 |------------------|-----------------------------------------------------------|
-| `src/main.rs`    | Entry point; wires config + buffer, hosts the stub loop.  |
+| `src/main.rs`    | Entry point; launches the GUI (feature `gui`) or CLI stub.|
+| `src/gui.rs`     | GTK4 + libadwaita control window (feature `gui`).         |
 | `src/buffer.rs`  | `ClipBuffer` ring buffer + `EncodedFrame` (implemented).  |
 | `src/config.rs`  | Runtime configuration and local-first defaults.           |
 
@@ -89,5 +99,6 @@ head) are muxed and written atomically to the user's output directory.
 - [ ] Hardware encoder integration (GStreamer / VA-API / NVENC)
 - [ ] Global hotkey registration (works under Wayland input constraints)
 - [ ] MP4/MKV muxing on flush
-- [ ] TOML config loading + first-run setup
-- [ ] Tray UI / minimal control surface
+- [ ] TOML config loading + first-run setup (persist GUI settings)
+- [ ] Wire the GUI toggle to the real capture thread
+- [ ] Tray icon / background daemon mode

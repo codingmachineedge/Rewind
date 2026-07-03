@@ -1,18 +1,32 @@
-//! ClipForge — lightweight, privacy-respecting game clip recorder.
+//! Rewind — lightweight, privacy-respecting game clip recorder.
 //!
 //! Target platform: Linux (Wayland via PipeWire/portal, and X11).
 //!
 //! This is an early scaffold. The real capture pipeline (PipeWire/portal screen
 //! capture -> encoder -> ring buffer) is stubbed out; see `docs/ARCHITECTURE.md`.
+//!
+//! Build the native GTK4 + libadwaita GUI with `cargo run --features gui`.
+//! Without the feature, this runs a headless CLI stub that exercises the buffer.
 
 mod buffer;
 mod config;
 
-use buffer::ClipBuffer;
-use config::Config;
+#[cfg(feature = "gui")]
+mod gui;
 
+/// GUI entry point (GTK4 + libadwaita).
+#[cfg(feature = "gui")]
 fn main() {
-    println!("ClipForge v{} — privacy-first clip recorder", env!("CARGO_PKG_VERSION"));
+    gui::run();
+}
+
+/// Headless CLI stub — used when built without the `gui` feature.
+#[cfg(not(feature = "gui"))]
+fn main() {
+    use buffer::ClipBuffer;
+    use config::Config;
+
+    println!("Rewind v{} — privacy-first clip recorder", env!("CARGO_PKG_VERSION"));
     println!("No account. No telemetry. Your footage stays on your machine.\n");
 
     let config = Config::default();
@@ -32,6 +46,7 @@ fn main() {
     // and register the global hotkey that calls `clip_buffer.flush_to_clip()`.
     println!("[stub] Capture pipeline not yet implemented — see docs/ARCHITECTURE.md.");
     println!("[stub] Would open a PipeWire/portal ScreenCast (Wayland) or X11 capture and begin buffering.");
+    println!("[stub] Tip: build the GUI with `cargo run --features gui`.\n");
 
     // Demonstrate the buffer API so the skeleton is exercised and buildable.
     clip_buffer.push_frame_placeholder();

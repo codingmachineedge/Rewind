@@ -1,6 +1,6 @@
 //! Rolling in-memory clip buffer.
 //!
-//! The core idea of ClipForge: frames are continuously encoded into a fixed-size
+//! The core idea of Rewind: frames are continuously encoded into a fixed-size
 //! ring buffer. When the user presses the save hotkey, the buffer's contents
 //! (the last N seconds) are flushed to a container file on disk. Nothing touches
 //! the disk until the user asks for it.

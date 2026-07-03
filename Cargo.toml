@@ -1,27 +1,33 @@
 [package]
-name = "clipforge"
+name = "rewind"
 version = "0.1.0"
 edition = "2021"
 description = "Lightweight, privacy-respecting game clip recorder for Linux — a ShadowPlay / Xbox Game Bar alternative."
 license = "MIT"
-repository = "https://github.com/codingmachineedge/ClipForge"
+repository = "https://github.com/codingmachineedge/Rewind"
 readme = "README.md"
 keywords = ["game", "capture", "recording", "shadowplay", "linux"]
-categories = ["multimedia::video", "command-line-utilities"]
+categories = ["multimedia::video", "gui"]
 
 [[bin]]
-name = "clipforge"
+name = "rewind"
 path = "src/main.rs"
 
+[features]
+default = []
+# Native Linux GUI (GTK4 + libadwaita). Requires the GTK4 + libadwaita dev
+# libraries and pkg-config on the build host (Linux). Kept out of the default
+# build so the core scaffold + ring buffer compile anywhere without system deps.
+gui = ["dep:gtk4", "dep:libadwaita"]
+
 [dependencies]
-# Capture/encoding crates (pipewire, gstreamer, ashpd for the desktop portal,
-# x11rb, etc.) will be added as the pipeline is implemented. Kept dependency-free
-# for now so the scaffold builds instantly on any stable toolchain.
+# GUI stack — pulled in only with `--features gui`.
+gtk4 = { version = "0.9", optional = true }
+libadwaita = { version = "0.7", optional = true, features = ["v1_4"] }
 
 [profile.release]
 # Favor a small, low-overhead binary — this tool runs alongside games.
 opt-level = "z"
 lto = true
 codegen-units = 1
-panic = "abort"
 strip = true
