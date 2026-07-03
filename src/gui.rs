@@ -106,6 +106,20 @@ fn build_ui(app: &adw::Application) {
     hotkey_row.add_suffix(&hotkey_entry);
     group.add(&hotkey_row);
 
+    let audio_row = adw::SwitchRow::builder()
+        .title("Capture audio")
+        .subtitle("Mux system audio into the clip")
+        .active(true)
+        .build();
+    group.add(&audio_row);
+
+    let convert_row = adw::SwitchRow::builder()
+        .title("Auto-convert after save")
+        .subtitle("Transcode to a shareable H.264/AAC MP4")
+        .active(true)
+        .build();
+    group.add(&convert_row);
+
     content.append(&status);
     content.append(&controls);
     content.append(&group);
@@ -120,6 +134,9 @@ fn build_ui(app: &adw::Application) {
                     PipelineEvent::Status(s) => status.set_text(&s),
                     PipelineEvent::ClipSaved(p) => {
                         status.set_text(&format!("Saved clip → {}", p.display()))
+                    }
+                    PipelineEvent::ClipConverted(p) => {
+                        status.set_text(&format!("Shareable clip ready → {}", p.display()))
                     }
                     PipelineEvent::Error(e) => status.set_text(&format!("⚠ {e}")),
                 }
@@ -136,11 +153,15 @@ fn build_ui(app: &adw::Application) {
         let buffer_spin = buffer_spin.clone();
         let folder_entry = folder_entry.clone();
         let hotkey_entry = hotkey_entry.clone();
+        let audio_row = audio_row.clone();
+        let convert_row = convert_row.clone();
         move || {
             let mut cfg = core.config.lock().unwrap();
             cfg.buffer_seconds = buffer_spin.value() as u32;
             cfg.output_dir = PathBuf::from(folder_entry.text().as_str());
             cfg.save_hotkey = hotkey_entry.text().to_string();
+            cfg.capture_audio = audio_row.is_active();
+            cfg.auto_convert = convert_row.is_active();
         }
     };
 

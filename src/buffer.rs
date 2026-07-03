@@ -108,6 +108,7 @@ mod tests {
             pts_ns: pts_ms * 1_000_000,
             dts_ns: None,
             is_keyframe: key,
+            track: crate::media::Track::Video,
         }
     }
 

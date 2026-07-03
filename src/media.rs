@@ -57,13 +57,54 @@ pub struct Frame {
     pub data: Arc<Vec<u8>>,
 }
 
-/// An encoded, muxable chunk of video (e.g. one H.264 access unit).
+/// Which track an encoded packet belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Track {
+    Video,
+    Audio,
+}
+
+/// An encoded, muxable chunk of media (an H.264 access unit or an AAC frame).
 #[derive(Clone)]
 pub struct EncodedPacket {
     pub data: Vec<u8>,
     pub pts_ns: u64,
     pub dts_ns: Option<u64>,
     pub is_keyframe: bool,
+    pub track: Track,
+}
+
+/// Audio codec for the muxed track.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioCodec {
+    Aac,
+    Opus,
+}
+
+impl AudioCodec {
+    pub fn label(self) -> &'static str {
+        match self {
+            AudioCodec::Aac => "AAC",
+            AudioCodec::Opus => "Opus",
+        }
+    }
+}
+
+/// Where audio is captured from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioSource {
+    /// System / game audio — the monitor of the default output sink.
+    SystemMonitor,
+    /// The default microphone / input source.
+    Microphone,
+}
+
+/// Negotiated audio-stream properties, for muxing.
+#[derive(Debug, Clone, Copy)]
+pub struct AudioInfo {
+    pub sample_rate: u32,
+    pub channels: u32,
+    pub codec: AudioCodec,
 }
 
 /// Video codec used for the buffered/encoded stream.
@@ -98,6 +139,19 @@ pub struct EncodeSettings {
     /// Maximum interval between keyframes, in frames. Smaller = tighter clip
     /// start alignment when flushing the ring buffer, at a small bitrate cost.
     pub keyframe_interval: u32,
+
+    // --- audio ---
+    /// Capture and mux an audio track alongside the video.
+    pub capture_audio: bool,
+    /// Where audio comes from (system output monitor, or the mic).
+    pub audio_source: AudioSource,
+    pub audio_codec: AudioCodec,
+    pub audio_bitrate_kbps: u32,
+
+    // --- post-save ---
+    /// After saving, transcode the clip to a standard, shareable H.264/AAC MP4
+    /// (faststart) as a background step.
+    pub auto_convert: bool,
 }
 
 impl Default for EncodeSettings {
@@ -107,6 +161,11 @@ impl Default for EncodeSettings {
             bitrate_kbps: 40_000,
             container: Container::Mp4,
             keyframe_interval: 60,
+            capture_audio: true,
+            audio_source: AudioSource::SystemMonitor,
+            audio_codec: AudioCodec::Aac,
+            audio_bitrate_kbps: 160,
+            auto_convert: true,
         }
     }
 }

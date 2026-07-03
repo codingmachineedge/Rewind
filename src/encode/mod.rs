@@ -8,7 +8,7 @@ use std::error::Error;
 use std::fmt;
 use std::path::Path;
 
-use crate::media::{EncodeSettings, EncodedPacket, Frame, StreamInfo};
+use crate::media::{AudioInfo, EncodeSettings, EncodedPacket, Frame, StreamInfo};
 
 #[cfg(feature = "encode-gstreamer")]
 pub mod gstreamer;
@@ -30,32 +30,63 @@ impl fmt::Display for EncodeError {
 
 impl Error for EncodeError {}
 
-/// A continuous encoder: raw frames in, encoded packets out.
+/// A continuous encoder: raw frames in, encoded packets out. When audio capture
+/// is enabled, the encoder also captures + encodes audio internally and emits
+/// [`crate::media::Track::Audio`]-tagged packets from `poll`/`flush`.
 pub trait Encoder: Send {
     fn name(&self) -> &str;
 
-    /// Configure the encoder for a negotiated stream. Called once before frames.
+    /// Configure the encoder for a negotiated video stream. Called once before
+    /// frames. Also starts the audio branch if `settings.capture_audio`.
     fn configure(&mut self, info: StreamInfo, settings: &EncodeSettings) -> Result<(), EncodeError>;
 
-    /// Submit a raw frame for encoding.
+    /// Submit a raw video frame for encoding.
     fn push_frame(&mut self, frame: &Frame) -> Result<(), EncodeError>;
 
-    /// Drain any encoded packets that are ready, delivering them to `sink`.
+    /// Drain any encoded packets that are ready (video and audio), delivering
+    /// them to `sink` tagged with their [`crate::media::Track`].
     fn poll(&mut self, sink: &mut dyn FnMut(EncodedPacket)) -> Result<(), EncodeError>;
 
     /// Flush remaining packets (e.g. on shutdown).
     fn flush(&mut self, sink: &mut dyn FnMut(EncodedPacket)) -> Result<(), EncodeError>;
+
+    /// Negotiated audio-track info, once configured with audio enabled.
+    fn audio_info(&self) -> Option<AudioInfo>;
 }
 
-/// Muxes an ordered set of encoded packets into a container file on disk.
+/// Muxes an ordered set of encoded packets into a container file on disk. When
+/// `audio` is non-empty, an audio track is muxed alongside the video.
 pub trait Muxer: Send {
     fn write_clip(
         &self,
-        packets: &[EncodedPacket],
+        video: &[EncodedPacket],
         info: StreamInfo,
+        audio: &[EncodedPacket],
+        audio_info: Option<AudioInfo>,
         settings: &EncodeSettings,
         out: &Path,
     ) -> Result<(), EncodeError>;
+}
+
+/// Transcode a saved clip into a standard, widely-playable H.264/AAC MP4 with
+/// `faststart` (moov atom relocated to the front for instant streaming). Runs as
+/// a post-save step when `settings.auto_convert` is set.
+pub fn convert_to_shareable(
+    input: &Path,
+    output: &Path,
+    settings: &EncodeSettings,
+) -> Result<(), EncodeError> {
+    #[cfg(feature = "encode-gstreamer")]
+    {
+        gstreamer::convert_to_shareable(input, output, settings)
+    }
+    #[cfg(not(feature = "encode-gstreamer"))]
+    {
+        let _ = (input, output, settings);
+        Err(EncodeError::Unsupported(
+            "auto-convert needs the `encode-gstreamer` feature".into(),
+        ))
+    }
 }
 
 /// Create the encoder backend, if one is built in.

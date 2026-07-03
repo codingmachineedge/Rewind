@@ -54,17 +54,23 @@ fn main() {
     let events: pipeline::EventSink = Arc::new(|event: PipelineEvent| match event {
         PipelineEvent::Status(s) => println!("[status] {s}"),
         PipelineEvent::ClipSaved(p) => println!("[saved]  clip written to {}", p.display()),
+        PipelineEvent::ClipConverted(p) => println!("[share]  converted to {}", p.display()),
         PipelineEvent::Error(e) => eprintln!("[error]  {e}"),
     });
 
     let mut pipeline = Pipeline::new(config, events);
     match pipeline.start() {
         Ok(()) if pipeline.is_running() => {
-            println!("\nCapturing. Recording the rolling buffer for a few seconds…");
-            std::thread::sleep(Duration::from_secs(3));
+            let secs: u64 = std::env::var("REWIND_CAPTURE_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(5);
+            println!("\nCapturing. Buffering the rolling window for {secs}s…");
+            std::thread::sleep(Duration::from_secs(secs));
             println!("Flushing the last N seconds to a clip…");
             pipeline.save_last_n();
-            std::thread::sleep(Duration::from_secs(1));
+            // Allow the background mux + auto-convert to finish.
+            std::thread::sleep(Duration::from_secs(15));
             pipeline.stop();
         }
         Ok(()) => println!("Pipeline did not start capturing."),

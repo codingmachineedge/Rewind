@@ -1,25 +1,22 @@
 //! GStreamer encode/mux backend (feature `encode-gstreamer`, Linux only).
 //!
-//! Two pieces implement the [`Encoder`] and [`Muxer`] traits from
-//! [`crate::encode`]:
+//! Three pieces:
 //!
-//! * [`GstEncoder`] runs a live, continuous pipeline
-//!   `appsrc ! videoconvert ! <hwenc|x264enc> ! h264parse|h265parse ! appsink`.
-//!   Raw [`Frame`]s are pushed into `appsrc`; encoded access units are pulled
-//!   out of `appsink` as [`EncodedPacket`]s.
-//! * [`GstMuxer`] builds a one-shot pipeline
-//!   `appsrc ! h264parse|h265parse ! <mp4mux|matroskamux> ! filesink` to write
-//!   a buffered clip to disk.
+//! * [`GstEncoder`] runs a live pipeline that encodes video —
+//!   `appsrc ! videoconvert ! <hwenc|x264enc> ! h264parse ! appsink` — and, when
+//!   audio is enabled, a parallel branch that captures + encodes audio —
+//!   `pulsesrc ! audioconvert ! audioresample ! <aacenc|opusenc> ! parse ! appsink`.
+//!   Both branches share the pipeline clock (video uses `do-timestamp`, audio is
+//!   a live source) so the two packet streams stay A/V-aligned.
+//! * [`GstMuxer`] muxes buffered video (+ audio) packets into an MP4/MKV file.
+//! * [`convert_to_shareable`] transcodes a saved clip to a standard H.264/AAC MP4
+//!   with `faststart` for sharing.
 //!
-//! Hardware encoders are selected at runtime by probing the GStreamer registry
-//! with [`gst::ElementFactory::find`], preferring VA-API, then NVENC, then a
-//! software fallback (`x264enc` / `x265enc`).
+//! Encoders are selected at runtime by probing the GStreamer registry, preferring
+//! VA-API, then NVENC, then software (`x264enc` / `x265enc`).
 //!
-//! NOTE: This module targets `gstreamer-rs` 0.23 and can only be *compiled and
-//! verified on a Linux host* with GStreamer + plugins installed. All `// NOTE:`
-//! comments below flag 0.23 API surface that should be double-checked against a
-//! real build (exact builder shapes, `try_pull_sample` signature, caps forms,
-//! element availability on the target machine).
+//! Targets `gstreamer-rs` 0.23. Compile- and run-verified on Linux with GStreamer
+//! plus the good/bad/libav plugin sets installed.
 
 use std::sync::Mutex;
 
@@ -28,66 +25,56 @@ use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 
 use crate::encode::{EncodeError, Encoder, Muxer};
-use crate::media::{Codec, Container, EncodeSettings, EncodedPacket, Frame, StreamInfo};
+use crate::media::{
+    AudioCodec, AudioInfo, AudioSource, Codec, Container, EncodeSettings, EncodedPacket, Frame,
+    StreamInfo, Track,
+};
 
 /// Initialize GStreamer. Idempotent: safe to call from every entry point.
 fn init() -> Result<(), EncodeError> {
     gst::init().map_err(|e| EncodeError::Backend(format!("gst::init failed: {e}")))
 }
 
-/// Map an arbitrary error (usually `glib::Error` / `BoolError`) to a backend error.
 fn backend<E: std::fmt::Display>(ctx: &str, e: E) -> EncodeError {
     EncodeError::Backend(format!("{ctx}: {e}"))
+}
+
+fn have_element(name: &str) -> bool {
+    gst::ElementFactory::find(name).is_some()
+}
+
+/// First registered element from a candidate list.
+fn first_available(candidates: &[&'static str]) -> Option<&'static str> {
+    candidates.iter().copied().find(|n| have_element(n))
 }
 
 // ---------------------------------------------------------------------------
 // Entry points
 // ---------------------------------------------------------------------------
 
-/// Construct the continuous GStreamer encoder.
 pub fn encoder() -> Result<Box<dyn Encoder>, EncodeError> {
     init()?;
     Ok(Box::new(GstEncoder::new()))
 }
 
-/// Construct the GStreamer muxer.
 pub fn muxer() -> Result<Box<dyn Muxer>, EncodeError> {
     init()?;
-    Ok(Box::new(GstMuxer::new()))
+    Ok(Box::new(GstMuxer))
 }
 
 // ---------------------------------------------------------------------------
-// Encoder-element selection
+// Element selection
 // ---------------------------------------------------------------------------
 
-/// A chosen encoder element factory name plus the parser that follows it.
 struct EncoderChoice {
-    /// e.g. `"vaapih264enc"`, `"nvh264enc"`, `"x264enc"`.
     enc: &'static str,
-    /// `"h264parse"` or `"h265parse"`.
     parse: &'static str,
-    /// The encoded-caps media type, e.g. `"video/x-h264"`.
     media_type: &'static str,
-    /// Whether the chosen encoder is the software fallback (needs tune/key-int).
     is_software: bool,
 }
 
-/// Return true if a GStreamer element factory of this name is registered.
-fn have_element(name: &str) -> bool {
-    // NOTE: 0.23 — `ElementFactory::find` returns `Option<ElementFactory>`.
-    gst::ElementFactory::find(name).is_some()
-}
-
-/// Pick an encoder element for the requested codec, in priority order.
-/// H264: vaapih264enc -> nvh264enc -> x264enc.
-/// HEVC: vaapih265enc -> nvh265enc -> x265enc.
 fn choose_encoder(codec: Codec) -> Result<EncoderChoice, EncodeError> {
-    let (candidates, parse, media_type, software): (
-        &[&'static str],
-        &'static str,
-        &'static str,
-        &'static str,
-    ) = match codec {
+    let (candidates, parse, media_type, software): (&[&str], &str, &str, &str) = match codec {
         Codec::H264 => (
             &["vaapih264enc", "nvh264enc", "x264enc"],
             "h264parse",
@@ -101,31 +88,87 @@ fn choose_encoder(codec: Codec) -> Result<EncoderChoice, EncodeError> {
             "x265enc",
         ),
     };
+    match first_available(candidates) {
+        Some(enc) => Ok(EncoderChoice {
+            enc,
+            parse,
+            media_type,
+            is_software: enc == software,
+        }),
+        None => Err(EncodeError::Unsupported(format!(
+            "no GStreamer encoder available for {codec:?} (tried {candidates:?})"
+        ))),
+    }
+}
 
-    for &name in candidates {
-        if have_element(name) {
-            return Ok(EncoderChoice {
-                enc: name,
-                parse,
-                media_type,
-                is_software: name == software,
-            });
+struct AudioChoice {
+    enc: &'static str,
+    /// Parser element between encoder and sink/mux, if any.
+    parse: Option<&'static str>,
+    /// Caps for the appsink / mux appsrc.
+    caps: gst::Caps,
+}
+
+fn choose_audio_encoder(codec: AudioCodec) -> Result<AudioChoice, EncodeError> {
+    match codec {
+        AudioCodec::Aac => {
+            let enc = first_available(&["avenc_aac", "fdkaacenc", "voaacenc"]).ok_or_else(|| {
+                EncodeError::Unsupported("no AAC encoder (avenc_aac/fdkaacenc/voaacenc)".into())
+            })?;
+            // ADTS is self-framing, so stored packets need no external codec_data.
+            let caps = gst::Caps::builder("audio/mpeg")
+                .field("mpegversion", 4i32)
+                .field("stream-format", "adts")
+                .build();
+            Ok(AudioChoice {
+                enc,
+                parse: Some("aacparse"),
+                caps,
+            })
+        }
+        AudioCodec::Opus => {
+            let enc = first_available(&["opusenc"])
+                .ok_or_else(|| EncodeError::Unsupported("no Opus encoder (opusenc)".into()))?;
+            let caps = gst::Caps::builder("audio/x-opus").build();
+            Ok(AudioChoice {
+                enc,
+                parse: Some("opusparse"),
+                caps,
+            })
         }
     }
+}
 
-    Err(EncodeError::Unsupported(format!(
-        "no GStreamer encoder available for {codec:?} (tried {candidates:?})"
-    )))
+/// Resolve the PulseAudio/PipeWire device string for a capture source.
+/// For system audio we target the default sink's monitor via `pactl`.
+fn resolve_audio_device(source: AudioSource) -> Option<String> {
+    match source {
+        AudioSource::Microphone => None, // pulsesrc default == default source (mic)
+        AudioSource::SystemMonitor => {
+            let out = std::process::Command::new("pactl")
+                .arg("get-default-sink")
+                .output()
+                .ok()?;
+            if !out.status.success() {
+                return None;
+            }
+            let sink = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if sink.is_empty() {
+                None
+            } else {
+                Some(format!("{sink}.monitor"))
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Continuous encoder
 // ---------------------------------------------------------------------------
 
-/// Live encoding pipeline. All GStreamer handles live behind a `Mutex` so the
-/// struct is `Send` regardless of the internal thread-affinity of the objects.
 pub struct GstEncoder {
     inner: Mutex<Option<EncoderInner>>,
+    audio: Mutex<Option<AudioInfo>>,
     name: String,
 }
 
@@ -133,6 +176,7 @@ struct EncoderInner {
     pipeline: gst::Pipeline,
     appsrc: gst_app::AppSrc,
     appsink: gst_app::AppSink,
+    appsink_audio: Option<gst_app::AppSink>,
     eos_sent: bool,
 }
 
@@ -140,6 +184,7 @@ impl GstEncoder {
     fn new() -> Self {
         Self {
             inner: Mutex::new(None),
+            audio: Mutex::new(None),
             name: "gstreamer".to_string(),
         }
     }
@@ -152,13 +197,9 @@ impl Encoder for GstEncoder {
 
     fn configure(&mut self, info: StreamInfo, settings: &EncodeSettings) -> Result<(), EncodeError> {
         let choice = choose_encoder(settings.codec)?;
-
         let pipeline = gst::Pipeline::new();
 
-        // --- appsrc -----------------------------------------------------------
-        // Raw video caps derived from the negotiated stream info.
-        // NOTE: 0.23 — `gst::Caps::builder("video/x-raw").field(...).build()`.
-        // Framerate is a `gst::Fraction` (num/den).
+        // --- video branch -----------------------------------------------------
         let src_caps = gst::Caps::builder("video/x-raw")
             .field("format", info.format.gst_format())
             .field("width", info.width as i32)
@@ -166,79 +207,46 @@ impl Encoder for GstEncoder {
             .field("framerate", gst::Fraction::new(info.framerate as i32, 1))
             .build();
 
-        // NOTE: 0.23 — `AppSrc::builder()` exists; `is_live`, `format`, `caps`
-        // are builder setters. Alternatively build via ElementFactory and set
-        // properties. Format::Time makes PTS meaningful.
         let appsrc = gst_app::AppSrc::builder()
             .caps(&src_caps)
             .is_live(true)
             .format(gst::Format::Time)
             .build();
-        // Reduce internal blocking / latency for a live source.
-        appsrc.set_do_timestamp(false);
+        // Stamp buffers with pipeline running-time on arrival, so video shares a
+        // clock with the live audio source and the two stay in sync.
+        appsrc.set_do_timestamp(true);
 
-        // --- videoconvert -----------------------------------------------------
         let videoconvert = gst::ElementFactory::make("videoconvert")
             .build()
             .map_err(|e| backend("make videoconvert", e))?;
-
-        // --- encoder ----------------------------------------------------------
         let encoder = gst::ElementFactory::make(choice.enc)
             .build()
             .map_err(|e| backend(&format!("make {}", choice.enc), e))?;
 
-        // Bitrate: property units differ per element. x264enc/x265enc take
-        // kbit/s (matching `bitrate_kbps`). VA-API/NVENC also generally accept a
-        // `bitrate` property in kbit/s. We set kbps directly.
-        // NOTE: property name is "bitrate" on all four; value type is u32/i32
-        // depending on element — `set_property` with a `u32` is accepted by
-        // x264enc/x265enc; VA-API uses u32 kbps, NVENC uses u32 kbps as well.
-        // If a build rejects the type, wrap with `i32`. Guarded with try.
         let _ = try_set_u32(&encoder, "bitrate", settings.bitrate_kbps);
-
         if choice.is_software {
-            // x264enc / x265enc software fallback tuning.
-            // tune=zerolatency (x264enc: flags enum; commonly settable by string
-            // via `set_property_from_str`). key-int-max = keyframe interval.
-            // NOTE: 0.23 — `set_property_from_str` sets enum/flags props from a
-            // string. "zerolatency" is a valid x264enc tune flag. x265enc uses a
-            // different tuning surface; the string set is best-effort here.
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 encoder.set_property_from_str("tune", "zerolatency");
             }));
             let _ = try_set_u32(&encoder, "key-int-max", settings.keyframe_interval);
         } else {
-            // Hardware encoders: keyframe cadence property is commonly named
-            // differently ("keyframe-period" / "gop-size" / "key-int-max").
-            // Best-effort across vendors.
             let _ = try_set_u32(&encoder, "key-int-max", settings.keyframe_interval);
             let _ = try_set_u32(&encoder, "keyframe-period", settings.keyframe_interval);
             let _ = try_set_u32(&encoder, "gop-size", settings.keyframe_interval);
         }
 
-        // --- parser -----------------------------------------------------------
         let parser = gst::ElementFactory::make(choice.parse)
             .build()
             .map_err(|e| backend(&format!("make {}", choice.parse), e))?;
 
-        // --- appsink ----------------------------------------------------------
-        // Constrain to byte-stream / au so downstream muxing and keyframe flags
-        // behave predictably.
         let sink_caps = gst::Caps::builder(choice.media_type)
             .field("stream-format", "byte-stream")
             .field("alignment", "au")
             .build();
-
-        let appsink = gst_app::AppSink::builder()
-            .caps(&sink_caps)
-            .build();
-        // We pull manually in `poll`/`flush`; `emit-signals` defaults to false,
-        // so there is nothing to disable here.
-        // Don't let the sink block the streaming thread indefinitely.
-        appsink.set_max_buffers(0); // 0 == unlimited queue depth in appsink.
+        let appsink = gst_app::AppSink::builder().caps(&sink_caps).build();
+        appsink.set_max_buffers(0);
         appsink.set_drop(false);
 
-        // --- assemble ---------------------------------------------------------
         pipeline
             .add_many([
                 appsrc.upcast_ref::<gst::Element>(),
@@ -247,8 +255,7 @@ impl Encoder for GstEncoder {
                 &parser,
                 appsink.upcast_ref::<gst::Element>(),
             ])
-            .map_err(|e| backend("pipeline add_many", e))?;
-
+            .map_err(|e| backend("pipeline add_many (video)", e))?;
         gst::Element::link_many([
             appsrc.upcast_ref::<gst::Element>(),
             &videoconvert,
@@ -256,20 +263,40 @@ impl Encoder for GstEncoder {
             &parser,
             appsink.upcast_ref::<gst::Element>(),
         ])
-        .map_err(|e| backend("link encode chain", e))?;
+        .map_err(|e| backend("link video chain", e))?;
+
+        // --- audio branch (optional) -----------------------------------------
+        let mut appsink_audio = None;
+        let mut audio_info = None;
+        if settings.capture_audio {
+            match self.build_audio_branch(&pipeline, settings) {
+                Ok((sink, ai)) => {
+                    appsink_audio = Some(sink);
+                    audio_info = Some(ai);
+                }
+                Err(e) => {
+                    // Audio is best-effort: log via name suffix, keep video-only.
+                    eprintln!("[gstreamer] audio branch disabled: {e}");
+                }
+            }
+        }
+        *self.audio.lock().unwrap() = audio_info;
 
         pipeline
             .set_state(gst::State::Playing)
             .map_err(|e| backend("set encode pipeline Playing", e))?;
 
-        let mut guard = self.inner.lock().unwrap();
-        *guard = Some(EncoderInner {
+        self.name = match &audio_info {
+            Some(ai) => format!("gstreamer:{}+{}", choice.enc, ai.codec.label()),
+            None => format!("gstreamer:{}", choice.enc),
+        };
+        *self.inner.lock().unwrap() = Some(EncoderInner {
             pipeline,
             appsrc,
             appsink,
+            appsink_audio,
             eos_sent: false,
         });
-        self.name = format!("gstreamer:{}", choice.enc);
         Ok(())
     }
 
@@ -278,21 +305,8 @@ impl Encoder for GstEncoder {
         let inner = guard
             .as_mut()
             .ok_or_else(|| EncodeError::Backend("push_frame before configure".into()))?;
-
-        // Copy the frame bytes into a fresh GStreamer buffer.
-        // NOTE: 0.23 — `gst::Buffer::from_slice(impl AsRef<[u8]>)` copies data
-        // into a new buffer. `frame.data` is `Arc<Vec<u8>>`; deref to `&[u8]`.
-        let bytes: &[u8] = frame.data.as_slice();
-        let mut buffer = gst::Buffer::from_slice(bytes.to_vec());
-        {
-            let buf_ref = buffer.get_mut().ok_or_else(|| {
-                EncodeError::Backend("fresh buffer unexpectedly shared".into())
-            })?;
-            // ClockTime is nanoseconds. pts_ns is a monotonic ns timestamp.
-            buf_ref.set_pts(gst::ClockTime::from_nseconds(frame.pts_ns));
-        }
-
-        // NOTE: 0.23 — `AppSrc::push_buffer` returns `Result<FlowSuccess, FlowError>`.
+        // do-timestamp stamps PTS on arrival; just hand over the pixels.
+        let buffer = gst::Buffer::from_slice(frame.data.as_slice().to_vec());
         inner
             .appsrc
             .push_buffer(buffer)
@@ -305,7 +319,11 @@ impl Encoder for GstEncoder {
         let inner = guard
             .as_mut()
             .ok_or_else(|| EncodeError::Backend("poll before configure".into()))?;
-        drain(&inner.appsink, gst::ClockTime::ZERO, sink)
+        drain(&inner.appsink, gst::ClockTime::ZERO, Track::Video, sink)?;
+        if let Some(a) = &inner.appsink_audio {
+            drain(a, gst::ClockTime::ZERO, Track::Audio, sink)?;
+        }
+        Ok(())
     }
 
     fn flush(&mut self, sink: &mut dyn FnMut(EncodedPacket)) -> Result<(), EncodeError> {
@@ -315,7 +333,6 @@ impl Encoder for GstEncoder {
             .ok_or_else(|| EncodeError::Backend("flush before configure".into()))?;
 
         if !inner.eos_sent {
-            // NOTE: 0.23 — `AppSrc::end_of_stream` -> Result<FlowSuccess, FlowError>.
             inner
                 .appsrc
                 .end_of_stream()
@@ -323,85 +340,151 @@ impl Encoder for GstEncoder {
             inner.eos_sent = true;
         }
 
-        // Drain remaining samples. `try_pull_sample` with a small timeout returns
-        // None once the sink is EOS and empty.
-        // NOTE: 0.23 — `AppSink::try_pull_sample(Option<ClockTime>)` returns
-        // `Option<Sample>`. On EOS with an empty queue it returns None.
         let timeout = gst::ClockTime::from_mseconds(100);
-        while let Some(sample) = inner.appsink.try_pull_sample(Some(timeout)) {
-            if let Some(pkt) = sample_to_packet(&sample)? {
-                sink(pkt);
-            }
+        drain(&inner.appsink, timeout, Track::Video, sink)?;
+        if let Some(a) = &inner.appsink_audio {
+            drain(a, timeout, Track::Audio, sink)?;
         }
 
-        // Tear the pipeline down so a subsequent configure starts clean.
         inner
             .pipeline
             .set_state(gst::State::Null)
             .map_err(|e| backend("set encode pipeline Null", e))?;
         Ok(())
     }
+
+    fn audio_info(&self) -> Option<AudioInfo> {
+        *self.audio.lock().unwrap()
+    }
 }
 
-/// Non-blocking / bounded drain of an appsink into `sink`.
+impl GstEncoder {
+    /// Build + add the live audio capture/encode branch to `pipeline`, returning
+    /// the audio appsink and negotiated info.
+    fn build_audio_branch(
+        &self,
+        pipeline: &gst::Pipeline,
+        settings: &EncodeSettings,
+    ) -> Result<(gst_app::AppSink, AudioInfo), EncodeError> {
+        let src_name = first_available(&["pulsesrc", "pipewiresrc"])
+            .ok_or_else(|| EncodeError::Unsupported("no audio source (pulsesrc/pipewiresrc)".into()))?;
+        let achoice = choose_audio_encoder(settings.audio_codec)?;
+
+        let asrc = gst::ElementFactory::make(src_name)
+            .build()
+            .map_err(|e| backend(&format!("make {src_name}"), e))?;
+        if src_name == "pulsesrc" {
+            if let Some(dev) = resolve_audio_device(settings.audio_source) {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    asrc.set_property("device", dev);
+                }));
+            }
+        }
+
+        let aconv = gst::ElementFactory::make("audioconvert")
+            .build()
+            .map_err(|e| backend("make audioconvert", e))?;
+        let ares = gst::ElementFactory::make("audioresample")
+            .build()
+            .map_err(|e| backend("make audioresample", e))?;
+        let aenc = gst::ElementFactory::make(achoice.enc)
+            .build()
+            .map_err(|e| backend(&format!("make {}", achoice.enc), e))?;
+        // Audio bitrate props are in bits/sec; try u32 then i32.
+        let abits = settings.audio_bitrate_kbps.saturating_mul(1000);
+        if !try_set_u32(&aenc, "bitrate", abits) {
+            let _ = try_set_i32(&aenc, "bitrate", abits as i32);
+        }
+
+        let aparse = match achoice.parse {
+            Some(p) => Some(
+                gst::ElementFactory::make(p)
+                    .build()
+                    .map_err(|e| backend(&format!("make {p}"), e))?,
+            ),
+            None => None,
+        };
+
+        let asink = gst_app::AppSink::builder().caps(&achoice.caps).build();
+        asink.set_max_buffers(0);
+        asink.set_drop(false);
+
+        // Assemble the branch.
+        let mut chain: Vec<&gst::Element> = vec![&asrc, &aconv, &ares, &aenc];
+        if let Some(p) = &aparse {
+            chain.push(p);
+        }
+        let asink_el = asink.upcast_ref::<gst::Element>();
+        chain.push(asink_el);
+
+        pipeline
+            .add_many(chain.iter().copied())
+            .map_err(|e| backend("pipeline add_many (audio)", e))?;
+        gst::Element::link_many(chain.iter().copied())
+            .map_err(|e| backend("link audio chain", e))?;
+
+        let info = AudioInfo {
+            sample_rate: 48_000,
+            channels: 2,
+            codec: settings.audio_codec,
+        };
+        Ok((asink, info))
+    }
+}
+
+/// Drain ready samples from an appsink, tagging each with `track`.
 fn drain(
     appsink: &gst_app::AppSink,
     timeout: gst::ClockTime,
+    track: Track,
     sink: &mut dyn FnMut(EncodedPacket),
 ) -> Result<(), EncodeError> {
-    // ClockTime::ZERO => return immediately if nothing is queued.
     while let Some(sample) = appsink.try_pull_sample(Some(timeout)) {
-        if let Some(pkt) = sample_to_packet(&sample)? {
+        if let Some(pkt) = sample_to_packet(&sample, track)? {
             sink(pkt);
         }
     }
     Ok(())
 }
 
-/// Convert a pulled [`gst::Sample`] into an [`EncodedPacket`].
-///
-/// `is_keyframe` is the inverse of the buffer's `DELTA_UNIT` flag: a delta unit
-/// depends on prior frames, so its absence marks a keyframe.
-fn sample_to_packet(sample: &gst::Sample) -> Result<Option<EncodedPacket>, EncodeError> {
-    let buffer = match sample.buffer() {
-        Some(b) => b,
-        None => return Ok(None),
+fn sample_to_packet(sample: &gst::Sample, track: Track) -> Result<Option<EncodedPacket>, EncodeError> {
+    let Some(buffer) = sample.buffer() else {
+        return Ok(None);
     };
-
-    // NOTE: 0.23 — `Buffer::map_readable()` -> Result<MapReadable, BoolError>;
-    // `.as_slice()` yields `&[u8]`.
     let map = buffer
         .map_readable()
         .map_err(|e| backend("map buffer readable", e))?;
     let data = map.as_slice().to_vec();
-
     let pts_ns = buffer.pts().map(|t| t.nseconds()).unwrap_or(0);
     let dts_ns = buffer.dts().map(|t| t.nseconds());
-
-    // A buffer WITHOUT the DELTA_UNIT flag is a keyframe.
-    let is_keyframe = !buffer.flags().contains(gst::BufferFlags::DELTA_UNIT);
+    // Audio (AAC/Opus) frames are all independently decodable.
+    let is_keyframe =
+        track == Track::Audio || !buffer.flags().contains(gst::BufferFlags::DELTA_UNIT);
 
     Ok(Some(EncodedPacket {
         data,
         pts_ns,
         dts_ns,
         is_keyframe,
+        track,
     }))
 }
 
-/// Set a `u32` property if the element has it, swallowing type/absence errors.
-///
-/// GStreamer property setters panic on an unknown property or type mismatch, so
-/// we guard with `catch_unwind` to make cross-vendor property probing safe.
 fn try_set_u32(element: &gst::Element, name: &str, value: u32) -> bool {
-    // Only attempt if the property actually exists to avoid a guaranteed panic.
     if element.find_property(name).is_none() {
         return false;
     }
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        // NOTE: 0.23 — `ObjectExt::set_property(name, value)`. Value type must
-        // match the pspec; some encoders declare `bitrate` as i32/i64. We try
-        // u32 first; on a type mismatch the panic is caught and we return false.
+        element.set_property(name, value);
+    }))
+    .is_ok()
+}
+
+fn try_set_i32(element: &gst::Element, name: &str, value: i32) -> bool {
+    if element.find_property(name).is_none() {
+        return false;
+    }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         element.set_property(name, value);
     }))
     .is_ok()
@@ -411,157 +494,230 @@ fn try_set_u32(element: &gst::Element, name: &str, value: u32) -> bool {
 // Muxer
 // ---------------------------------------------------------------------------
 
-/// One-shot muxer: writes buffered packets to a container file.
 pub struct GstMuxer;
-
-impl GstMuxer {
-    fn new() -> Self {
-        GstMuxer
-    }
-}
 
 impl Muxer for GstMuxer {
     fn write_clip(
         &self,
-        packets: &[EncodedPacket],
+        video: &[EncodedPacket],
         _info: StreamInfo,
+        audio: &[EncodedPacket],
+        audio_info: Option<AudioInfo>,
         settings: &EncodeSettings,
         out: &std::path::Path,
     ) -> Result<(), EncodeError> {
         init()?;
 
-        let (parse, media_type) = match settings.codec {
+        let (vparse, vmedia) = match settings.codec {
             Codec::H264 => ("h264parse", "video/x-h264"),
             Codec::Hevc => ("h265parse", "video/x-h265"),
         };
-        let mux = match settings.container {
+        let mux_name = match settings.container {
             Container::Mp4 => "mp4mux",
             Container::Mkv => "matroskamux",
         };
 
         let pipeline = gst::Pipeline::new();
 
-        // Encoded-stream caps; h264parse/h265parse will (re)timestamp and
-        // convert to whatever alignment the muxer needs.
-        let src_caps = gst::Caps::builder(media_type)
-            .field("stream-format", "byte-stream")
-            .field("alignment", "au")
-            .build();
-
-        let appsrc = gst_app::AppSrc::builder()
-            .caps(&src_caps)
-            .is_live(false)
-            .format(gst::Format::Time)
-            .build();
-
-        let parser = gst::ElementFactory::make(parse)
+        let mux = gst::ElementFactory::make(mux_name)
             .build()
-            .map_err(|e| backend(&format!("make {parse}"), e))?;
-
-        let muxer = gst::ElementFactory::make(mux)
-            .build()
-            .map_err(|e| backend(&format!("make {mux}"), e))?;
-
+            .map_err(|e| backend(&format!("make {mux_name}"), e))?;
+        if settings.container == Container::Mp4 {
+            let _ = try_set_bool(&mux, "faststart", true);
+        }
         let filesink = gst::ElementFactory::make("filesink")
             .build()
             .map_err(|e| backend("make filesink", e))?;
-        // NOTE: 0.23 — filesink "location" is a string property. Path -> str;
-        // non-UTF-8 paths are rejected here (callers use UTF-8 clip paths).
         let location = out
             .to_str()
             .ok_or_else(|| EncodeError::Backend(format!("non-UTF-8 output path: {out:?}")))?;
         filesink.set_property("location", location);
 
         pipeline
-            .add_many([
-                appsrc.upcast_ref::<gst::Element>(),
-                &parser,
-                &muxer,
-                &filesink,
-            ])
-            .map_err(|e| backend("mux pipeline add_many", e))?;
+            .add_many([&mux, &filesink])
+            .map_err(|e| backend("mux add core", e))?;
+        gst::Element::link_many([&mux, &filesink]).map_err(|e| backend("link mux->filesink", e))?;
 
-        gst::Element::link_many([
-            appsrc.upcast_ref::<gst::Element>(),
-            &parser,
-            &muxer,
-            &filesink,
-        ])
-        .map_err(|e| backend("link mux chain", e))?;
+        // --- video branch ----------------------------------------------------
+        let v_caps = gst::Caps::builder(vmedia)
+            .field("stream-format", "byte-stream")
+            .field("alignment", "au")
+            .build();
+        let vsrc = gst_app::AppSrc::builder()
+            .caps(&v_caps)
+            .is_live(false)
+            .format(gst::Format::Time)
+            .build();
+        let vparse_el = gst::ElementFactory::make(vparse)
+            .build()
+            .map_err(|e| backend(&format!("make {vparse}"), e))?;
+        pipeline
+            .add_many([vsrc.upcast_ref::<gst::Element>(), &vparse_el])
+            .map_err(|e| backend("mux add video", e))?;
+        gst::Element::link_many([vsrc.upcast_ref::<gst::Element>(), &vparse_el])
+            .map_err(|e| backend("link video src->parse", e))?;
+        vparse_el
+            .link(&mux)
+            .map_err(|e| backend("link video parse->mux", e))?;
+
+        // --- audio branch (optional) -----------------------------------------
+        let asrc = if let Some(ai) = audio_info.filter(|_| !audio.is_empty()) {
+            let (a_caps, a_parse) = match ai.codec {
+                AudioCodec::Aac => (
+                    gst::Caps::builder("audio/mpeg")
+                        .field("mpegversion", 4i32)
+                        .field("stream-format", "adts")
+                        .build(),
+                    "aacparse",
+                ),
+                AudioCodec::Opus => (gst::Caps::builder("audio/x-opus").build(), "opusparse"),
+            };
+            let asrc = gst_app::AppSrc::builder()
+                .caps(&a_caps)
+                .is_live(false)
+                .format(gst::Format::Time)
+                .build();
+            let aparse_el = gst::ElementFactory::make(a_parse)
+                .build()
+                .map_err(|e| backend(&format!("make {a_parse}"), e))?;
+            pipeline
+                .add_many([asrc.upcast_ref::<gst::Element>(), &aparse_el])
+                .map_err(|e| backend("mux add audio", e))?;
+            gst::Element::link_many([asrc.upcast_ref::<gst::Element>(), &aparse_el])
+                .map_err(|e| backend("link audio src->parse", e))?;
+            aparse_el
+                .link(&mux)
+                .map_err(|e| backend("link audio parse->mux", e))?;
+            Some(asrc)
+        } else {
+            None
+        };
 
         pipeline
             .set_state(gst::State::Playing)
             .map_err(|e| backend("set mux pipeline Playing", e))?;
 
-        // Push every packet as a timestamped buffer.
-        for pkt in packets {
-            let mut buffer = gst::Buffer::from_slice(pkt.data.clone());
-            {
-                let buf_ref = buffer
-                    .get_mut()
-                    .ok_or_else(|| EncodeError::Backend("fresh mux buffer shared".into()))?;
-                buf_ref.set_pts(gst::ClockTime::from_nseconds(pkt.pts_ns));
-                if let Some(dts) = pkt.dts_ns {
-                    buf_ref.set_dts(gst::ClockTime::from_nseconds(dts));
-                }
-                if !pkt.is_keyframe {
-                    // Mark delta units so the parser/muxer treat non-keyframes
-                    // correctly (keyframes carry no DELTA_UNIT flag).
-                    buf_ref.set_flags(gst::BufferFlags::DELTA_UNIT);
-                }
-            }
-            appsrc
-                .push_buffer(buffer)
-                .map_err(|e| backend("mux appsrc push_buffer", e))?;
+        push_packets(&vsrc, video)?;
+        vsrc.end_of_stream()
+            .map_err(|e| backend("video eos", e))?;
+        if let Some(asrc) = &asrc {
+            push_packets(asrc, audio)?;
+            asrc.end_of_stream().map_err(|e| backend("audio eos", e))?;
         }
 
-        // Signal end of stream and wait for the muxer to finalize the file.
-        appsrc
-            .end_of_stream()
-            .map_err(|e| backend("mux appsrc end_of_stream", e))?;
-
-        // Run the bus loop until EOS or error.
-        let bus = pipeline
-            .bus()
-            .ok_or_else(|| EncodeError::Backend("mux pipeline has no bus".into()))?;
-
-        let mut result = Ok(());
-        let mut saw_eos = false;
-        // NOTE: 0.23 — `Bus::iter_timed(Option<ClockTime>)` yields messages.
-        // `ClockTime::NONE` blocks indefinitely; we use a generous per-message
-        // timeout so a stalled pipeline eventually ends the iterator (yields
-        // None) rather than hanging forever.
-        for msg in bus.iter_timed(Some(gst::ClockTime::from_seconds(30))) {
-            use gst::MessageView;
-            match msg.view() {
-                MessageView::Eos(_) => {
-                    saw_eos = true;
-                    break;
-                }
-                MessageView::Error(err) => {
-                    result = Err(EncodeError::Backend(format!(
-                        "mux pipeline error from {:?}: {} ({:?})",
-                        err.src().map(|s| s.path_string()),
-                        err.error(),
-                        err.debug()
-                    )));
-                    break;
-                }
-                _ => {}
-            }
-        }
-
-        // If the loop ended (per-message timeout with no more messages) without
-        // an explicit EOS or error, the file is likely incomplete.
-        if result.is_ok() && !saw_eos {
-            result = Err(EncodeError::Backend(
-                "mux pipeline timed out before EOS".into(),
-            ));
-        }
-
-        // Always attempt to return the pipeline to Null.
-        let _ = pipeline.set_state(gst::State::Null);
-
-        result
+        wait_for_eos(&pipeline, 30)
     }
+}
+
+/// Push encoded packets into an appsrc as timestamped buffers.
+fn push_packets(src: &gst_app::AppSrc, packets: &[EncodedPacket]) -> Result<(), EncodeError> {
+    for pkt in packets {
+        let mut buffer = gst::Buffer::from_slice(pkt.data.clone());
+        {
+            let buf = buffer
+                .get_mut()
+                .ok_or_else(|| EncodeError::Backend("fresh mux buffer shared".into()))?;
+            buf.set_pts(gst::ClockTime::from_nseconds(pkt.pts_ns));
+            if let Some(dts) = pkt.dts_ns {
+                buf.set_dts(gst::ClockTime::from_nseconds(dts));
+            }
+            if !pkt.is_keyframe {
+                buf.set_flags(gst::BufferFlags::DELTA_UNIT);
+            }
+        }
+        src.push_buffer(buffer)
+            .map_err(|e| backend("mux push_buffer", e))?;
+    }
+    Ok(())
+}
+
+/// Run a pipeline's bus until EOS (success) or an error / timeout.
+fn wait_for_eos(pipeline: &gst::Pipeline, secs: u64) -> Result<(), EncodeError> {
+    let bus = pipeline
+        .bus()
+        .ok_or_else(|| EncodeError::Backend("pipeline has no bus".into()))?;
+    let mut result = Ok(());
+    let mut saw_eos = false;
+    for msg in bus.iter_timed(Some(gst::ClockTime::from_seconds(secs))) {
+        use gst::MessageView;
+        match msg.view() {
+            MessageView::Eos(_) => {
+                saw_eos = true;
+                break;
+            }
+            MessageView::Error(err) => {
+                result = Err(EncodeError::Backend(format!(
+                    "pipeline error from {:?}: {} ({:?})",
+                    err.src().map(|s| s.path_string()),
+                    err.error(),
+                    err.debug()
+                )));
+                break;
+            }
+            _ => {}
+        }
+    }
+    if result.is_ok() && !saw_eos {
+        result = Err(EncodeError::Backend("pipeline timed out before EOS".into()));
+    }
+    let _ = pipeline.set_state(gst::State::Null);
+    result
+}
+
+fn try_set_bool(element: &gst::Element, name: &str, value: bool) -> bool {
+    if element.find_property(name).is_none() {
+        return false;
+    }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        element.set_property(name, value);
+    }))
+    .is_ok()
+}
+
+// ---------------------------------------------------------------------------
+// Auto-convert (post-save transcode to shareable MP4)
+// ---------------------------------------------------------------------------
+
+/// Transcode `input` to a standard H.264/AAC MP4 with `faststart` at `output`.
+pub fn convert_to_shareable(
+    input: &std::path::Path,
+    output: &std::path::Path,
+    settings: &EncodeSettings,
+) -> Result<(), EncodeError> {
+    init()?;
+
+    let inp = input
+        .to_str()
+        .ok_or_else(|| EncodeError::Backend(format!("non-UTF-8 input path: {input:?}")))?;
+    let outp = output
+        .to_str()
+        .ok_or_else(|| EncodeError::Backend(format!("non-UTF-8 output path: {output:?}")))?;
+
+    let vkbps = settings.bitrate_kbps.max(1_000);
+    let abits = settings.audio_bitrate_kbps.max(96).saturating_mul(1000);
+
+    // decodebin exposes dynamic pads; the launch parser links them to the
+    // matching branch by caps. Audio branch is included only if we expect audio.
+    let audio_branch = if settings.capture_audio {
+        format!(
+            " d. ! queue ! audioconvert ! audioresample ! avenc_aac bitrate={abits} ! aacparse ! m."
+        )
+    } else {
+        String::new()
+    };
+    let desc = format!(
+        "filesrc location=\"{inp}\" ! decodebin name=d \
+         d. ! queue ! videoconvert ! x264enc bitrate={vkbps} speed-preset=veryfast key-int-max=60 \
+         ! h264parse ! mp4mux name=m faststart=true ! filesink location=\"{outp}\"{audio_branch}"
+    );
+
+    let element = gst::parse::launch(&desc).map_err(|e| backend("parse convert pipeline", e))?;
+    let pipeline = element
+        .downcast::<gst::Pipeline>()
+        .map_err(|_| EncodeError::Backend("convert pipeline is not a Pipeline".into()))?;
+
+    pipeline
+        .set_state(gst::State::Playing)
+        .map_err(|e| backend("set convert pipeline Playing", e))?;
+    wait_for_eos(&pipeline, 120)
 }
