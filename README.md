@@ -14,6 +14,7 @@ Linux gamers have never had a great "instant replay" tool. The mainstream option
 - **Save-last-N-seconds hotkey** — press a global hotkey to instantly flush the buffer to an `.mp4`/`.mkv` clip.
 - **Audio too** — captures system/game audio via PipeWire and muxes it alongside the video, A/V aligned.
 - **Auto-convert to shareable** — after each save, transcodes the clip to a standard H.264/AAC MP4 (faststart) in the background.
+- **Copy to clipboard (optional)** — off by default; when on, the finished clip is placed on the clipboard as a pasteable file, ready to drop into chat.
 - **Low overhead** — hardware-accelerated capture and GPU (VA-API / NVENC) encoding to minimize FPS impact.
 - **No telemetry, no account** — nothing is uploaded, nothing is tracked, no login required.
 - **Local-first** — clips are written straight to a folder you choose; you own your data.

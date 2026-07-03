@@ -83,9 +83,9 @@ impl PipelineCore {
         let audio: Vec<EncodedPacket> = self.audio_buffer.lock().unwrap().snapshot();
         let audio_info = *self.audio_info.lock().unwrap();
 
-        let (settings, out) = {
+        let (settings, out, copy_clip) = {
             let cfg = self.config.lock().unwrap();
-            (cfg.encode_settings(), cfg.new_clip_path())
+            (cfg.encode_settings(), cfg.new_clip_path(), cfg.copy_to_clipboard)
         };
 
         if let Some(parent) = out.parent() {
@@ -113,6 +113,8 @@ impl PipelineCore {
                     )));
 
                     // Post-save: auto-convert to a shareable H.264/AAC MP4.
+                    // Track the final artifact (converted copy if it succeeded).
+                    let mut final_path = out.clone();
                     if settings.auto_convert {
                         let share = Config::shareable_path(&out);
                         this.emit(PipelineEvent::Status(format!(
@@ -120,10 +122,22 @@ impl PipelineCore {
                             share.display()
                         )));
                         match encode::convert_to_shareable(&out, &share, &settings) {
-                            Ok(()) => this.emit(PipelineEvent::ClipConverted(share)),
+                            Ok(()) => {
+                                final_path = share.clone();
+                                this.emit(PipelineEvent::ClipConverted(share));
+                            }
                             Err(e) => this.emit(PipelineEvent::Error(format!(
                                 "auto-convert failed: {e}"
                             ))),
+                        }
+                    }
+
+                    // Optional: copy the finished clip to the clipboard.
+                    if copy_clip {
+                        match crate::clipboard::copy_file(&final_path) {
+                            Ok(msg) => this.emit(PipelineEvent::Status(msg)),
+                            Err(e) => this
+                                .emit(PipelineEvent::Error(format!("clipboard: {e}"))),
                         }
                     }
                 }

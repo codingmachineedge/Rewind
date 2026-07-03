@@ -120,6 +120,13 @@ fn build_ui(app: &adw::Application) {
         .build();
     group.add(&convert_row);
 
+    let clipboard_row = adw::SwitchRow::builder()
+        .title("Copy clip to clipboard")
+        .subtitle("Paste the saved clip straight into chat")
+        .active(false)
+        .build();
+    group.add(&clipboard_row);
+
     content.append(&status);
     content.append(&controls);
     content.append(&group);
@@ -155,6 +162,7 @@ fn build_ui(app: &adw::Application) {
         let hotkey_entry = hotkey_entry.clone();
         let audio_row = audio_row.clone();
         let convert_row = convert_row.clone();
+        let clipboard_row = clipboard_row.clone();
         move || {
             let mut cfg = core.config.lock().unwrap();
             cfg.buffer_seconds = buffer_spin.value() as u32;
@@ -162,6 +170,7 @@ fn build_ui(app: &adw::Application) {
             cfg.save_hotkey = hotkey_entry.text().to_string();
             cfg.capture_audio = audio_row.is_active();
             cfg.auto_convert = convert_row.is_active();
+            cfg.copy_to_clipboard = clipboard_row.is_active();
         }
     };
 

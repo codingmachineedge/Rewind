@@ -35,6 +35,9 @@ pub struct Config {
 
     /// After saving, auto-convert the clip to a shareable H.264/AAC MP4.
     pub auto_convert: bool,
+    /// After saving, copy the finished clip to the clipboard as a pasteable file
+    /// reference. Off by default (optional).
+    pub copy_to_clipboard: bool,
 }
 
 impl Default for Config {
@@ -51,6 +54,7 @@ impl Default for Config {
             audio_source: AudioSource::SystemMonitor,
             audio_bitrate_kbps: 160,
             auto_convert: true,
+            copy_to_clipboard: false,
         }
     }
 }

@@ -18,6 +18,7 @@
 
 mod buffer;
 mod capture;
+mod clipboard;
 mod config;
 mod encode;
 mod hotkey;
@@ -45,10 +46,16 @@ fn main() {
     println!("Rewind v{} — privacy-first clip recorder", env!("CARGO_PKG_VERSION"));
     println!("No account. No telemetry. Your footage stays on your machine.\n");
 
-    let config = Config::default();
+    let mut config = Config::default();
+    // Opt-in clipboard copy for headless runs: REWIND_CLIPBOARD=1
+    config.copy_to_clipboard = std::env::var("REWIND_CLIPBOARD").is_ok();
     println!(
-        "Config: buffer={}s, fps={}, output={:?}, hotkey={}",
-        config.buffer_seconds, config.target_fps, config.output_dir, config.save_hotkey
+        "Config: buffer={}s, fps={}, output={:?}, hotkey={}, clipboard={}",
+        config.buffer_seconds,
+        config.target_fps,
+        config.output_dir,
+        config.save_hotkey,
+        config.copy_to_clipboard
     );
 
     let events: pipeline::EventSink = Arc::new(|event: PipelineEvent| match event {
