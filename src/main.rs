@@ -21,6 +21,7 @@ mod buffer;
 mod capture;
 mod clipboard;
 mod config;
+mod crashlog;
 mod encode;
 mod hotkey;
 mod media;
@@ -32,6 +33,7 @@ mod gui;
 /// GUI entry point (GTK4 + libadwaita).
 #[cfg(feature = "gui")]
 fn main() {
+    crashlog::install();
     // Handle --install-autostart / --uninstall-autostart before GTK sees argv.
     if autostart::handle_cli_args() {
         return;
@@ -45,6 +47,7 @@ fn main() {
     use std::sync::Arc;
     use std::time::Duration;
 
+    crashlog::install();
     if autostart::handle_cli_args() {
         return;
     }

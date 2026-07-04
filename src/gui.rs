@@ -283,7 +283,13 @@ fn build_ui(app: &adw::Application) {
         toggle.connect_toggled(move |btn| {
             if btn.is_active() {
                 apply_settings();
-                match pipeline.borrow_mut().start() {
+                // IMPORTANT: end the RefCell borrow before touching `btn`.
+                // `set_active(false)` re-enters this handler synchronously; if the
+                // `RefMut` from a `match pipeline.borrow_mut().start()` scrutinee
+                // were still alive, the re-entrant `borrow_mut()` would panic
+                // (BorrowMutError) and crash the app whenever start() fails.
+                let result = pipeline.borrow_mut().start();
+                match result {
                     Ok(()) => {
                         btn.set_label("Stop Capture");
                         btn.remove_css_class("suggested-action");
