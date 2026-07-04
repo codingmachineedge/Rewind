@@ -61,12 +61,21 @@ fn main() {
     let mut config = Config::default();
     // Opt-in clipboard copy for headless runs: REWIND_CLIPBOARD=1
     config.copy_to_clipboard = std::env::var("REWIND_CLIPBOARD").is_ok();
+    // Capture target for headless runs: REWIND_CAPTURE_TARGET=monitor|window|active
+    if let Ok(t) = std::env::var("REWIND_CAPTURE_TARGET") {
+        config.capture_target = match t.to_ascii_lowercase().as_str() {
+            "window" => media::CaptureTarget::Window,
+            "active" | "active-window" => media::CaptureTarget::ActiveWindow,
+            _ => media::CaptureTarget::Monitor,
+        };
+    }
     println!(
-        "Config: buffer={}s, fps={}, output={:?}, hotkey={}, clipboard={}",
+        "Config: buffer={}s, fps={}, output={:?}, hotkey={}, target={:?}, clipboard={}",
         config.buffer_seconds,
         config.target_fps,
         config.output_dir,
         config.save_hotkey,
+        config.capture_target,
         config.copy_to_clipboard
     );
 
