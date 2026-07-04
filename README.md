@@ -29,7 +29,7 @@ The usual advice is "OBS has a replay buffer — have it always on, start OBS at
 - **No telemetry, no account** — nothing is uploaded, nothing is tracked, no login required.
 - **Local-first** — clips are written straight to a folder you choose; you own your data.
 - **Wayland *and* X11** — first-class support for the modern Linux desktop, with a fallback for legacy sessions.
-- **Native GUI** — a small GTK4 + libadwaita control window (start/stop, save, settings), plus a headless mode.
+- **Native GUI** — a modern GTK4 + libadwaita window: status card with a live REC indicator, pill actions, toast notifications, Adwaita settings rows. Headless CLI mode included.
 - **Configurable** — buffer length, output quality, hotkey, audio, and save location.
 
 ## Linux capture stack
