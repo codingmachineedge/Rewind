@@ -205,12 +205,17 @@ impl Pipeline {
         }
 
         // Re-create the buffers to match current settings.
-        let (fps, settings, accelerator) = {
+        let (fps, settings, accelerator, capture_target) = {
             let cfg = self.core.config.lock().unwrap();
             *self.core.buffer.lock().unwrap() =
                 ClipBuffer::new(cfg.buffer_seconds, cfg.target_fps);
             *self.core.audio_buffer.lock().unwrap() = ClipBuffer::new(cfg.buffer_seconds, 100);
-            (cfg.target_fps, cfg.encode_settings(), cfg.save_hotkey.clone())
+            (
+                cfg.target_fps,
+                cfg.encode_settings(),
+                cfg.save_hotkey.clone(),
+                cfg.capture_target,
+            )
         };
         *self.core.stream_info.lock().unwrap() = None;
         *self.core.audio_info.lock().unwrap() = None;
@@ -285,7 +290,7 @@ impl Pipeline {
         }));
 
         // Capture source: push frames into the encode channel.
-        let mut source = capture::create_source().map_err(|e| {
+        let mut source = capture::create_source(capture_target).map_err(|e| {
             self.running.store(false, Ordering::Release);
             e.to_string()
         })?;

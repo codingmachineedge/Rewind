@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::media::{AudioCodec, AudioSource, Codec, Container, EncodeSettings};
+use crate::media::{AudioCodec, AudioSource, CaptureTarget, Codec, Container, EncodeSettings};
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -19,6 +19,9 @@ pub struct Config {
     pub output_dir: PathBuf,
     /// Global hotkey that flushes the buffer to a clip.
     pub save_hotkey: String,
+    /// What to capture: the whole monitor, a specific window (re-attached across
+    /// relaunches), or whichever window is active when capture starts.
+    pub capture_target: CaptureTarget,
     /// Encoder target bitrate, in kilobits per second.
     pub bitrate_kbps: u32,
     /// Output container format.
@@ -47,6 +50,7 @@ impl Default for Config {
             target_fps: 60,
             output_dir: PathBuf::from("clips"),
             save_hotkey: "Ctrl+Alt+S".to_string(),
+            capture_target: CaptureTarget::Monitor,
             bitrate_kbps: 40_000,
             container: Container::Mp4,
             codec: Codec::H264,

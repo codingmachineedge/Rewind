@@ -9,8 +9,9 @@
 
 use std::error::Error;
 use std::fmt;
+use std::path::PathBuf;
 
-use crate::media::{Frame, StreamInfo};
+use crate::media::{CaptureTarget, Frame, StreamInfo};
 
 #[cfg(feature = "capture-wayland")]
 pub mod wayland;
@@ -58,15 +59,16 @@ pub trait FrameSource: Send {
     fn stop(&mut self);
 }
 
-/// Select and open the best capture backend for the current session.
-pub fn create_source() -> Result<Box<dyn FrameSource>, CaptureError> {
+/// Select and open the best capture backend for the current session, grabbing
+/// `target` (whole monitor, a specific window, or the active window).
+pub fn create_source(target: CaptureTarget) -> Result<Box<dyn FrameSource>, CaptureError> {
     let session = std::env::var("XDG_SESSION_TYPE").unwrap_or_default();
     match session.as_str() {
-        "wayland" => open_wayland(),
-        "x11" => open_x11(),
+        "wayland" => open_wayland(target),
+        "x11" => open_x11(target),
         other => {
             // Unknown/empty session: try Wayland, then X11.
-            open_wayland().or_else(|_| open_x11()).map_err(|_| {
+            open_wayland(target).or_else(|_| open_x11(target)).map_err(|_| {
                 CaptureError::Unsupported(format!(
                     "no capture backend available for session '{other}' \
                      (build with --features capture-wayland,capture-x11)"
@@ -77,25 +79,36 @@ pub fn create_source() -> Result<Box<dyn FrameSource>, CaptureError> {
 }
 
 #[cfg(feature = "capture-wayland")]
-fn open_wayland() -> Result<Box<dyn FrameSource>, CaptureError> {
-    wayland::open()
+fn open_wayland(target: CaptureTarget) -> Result<Box<dyn FrameSource>, CaptureError> {
+    wayland::open(target)
 }
 
 #[cfg(not(feature = "capture-wayland"))]
-fn open_wayland() -> Result<Box<dyn FrameSource>, CaptureError> {
+fn open_wayland(_target: CaptureTarget) -> Result<Box<dyn FrameSource>, CaptureError> {
     Err(CaptureError::Unsupported(
         "wayland capture not built (enable feature `capture-wayland`)".into(),
     ))
 }
 
 #[cfg(feature = "capture-x11")]
-fn open_x11() -> Result<Box<dyn FrameSource>, CaptureError> {
-    x11::open()
+fn open_x11(target: CaptureTarget) -> Result<Box<dyn FrameSource>, CaptureError> {
+    x11::open(target)
 }
 
 #[cfg(not(feature = "capture-x11"))]
-fn open_x11() -> Result<Box<dyn FrameSource>, CaptureError> {
+fn open_x11(_target: CaptureTarget) -> Result<Box<dyn FrameSource>, CaptureError> {
     Err(CaptureError::Unsupported(
         "x11 capture not built (enable feature `capture-x11`)".into(),
     ))
+}
+
+/// `${XDG_CONFIG_HOME:-~/.config}/rewind` — where backends persist small bits of
+/// state (the Wayland restore token, the X11 window target). `None` when neither
+/// `$XDG_CONFIG_HOME` nor `$HOME` is set. The directory is not created here.
+pub(crate) fn config_dir() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    Some(base.join("rewind"))
 }

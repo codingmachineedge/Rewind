@@ -58,6 +58,22 @@ The capture layer is abstracted behind a `FrameSource` trait so `main` is
 agnostic to which backend (Wayland/PipeWire or X11) is active; selection happens
 at runtime from `$XDG_SESSION_TYPE`.
 
+### Capture target (monitor vs window)
+
+`Config::capture_target` (a `CaptureTarget`) chooses what to grab, exposed as a
+dropdown in the GUI:
+
+- **Monitor** — the whole screen / X11 root window (default, original behavior).
+- **Window** — a single window, re-attached across relaunches. On X11 the chosen
+  window's `WM_CLASS`/title is persisted to `~/.config/rewind/window.target` and
+  re-found via `_NET_CLIENT_LIST`; XComposite (`RedirectAutomatic` +
+  `NameWindowPixmap`) lets occluded windows still capture. On Wayland the portal
+  owns window selection and the per-target `restore_token` handles re-attach, so
+  relaunches don't re-prompt (the origin-thread complaint about OBS).
+- **Active window** — X11 resolves `_NET_ACTIVE_WINDOW` at capture start (and
+  remembers it for Window mode); Wayland treats this as Window (no portal API for
+  the active window).
+
 ## Encoder & muxer
 
 A **GStreamer** pipeline handles hardware-accelerated H.264/HEVC encoding
@@ -93,8 +109,8 @@ system libraries. The `main.rs` CLI path remains as a headless fallback.
 | `src/buffer.rs`            | —                  | `ClipBuffer` — time-bounded ring of encoded packets, keyframe snapshot.|
 | `src/pipeline.rs`          | —                  | Orchestrator: capture → encode worker → buffer → save; hotkey wiring. |
 | `src/capture/mod.rs`       | —                  | `FrameSource` trait + `$XDG_SESSION_TYPE` backend selector.           |
-| `src/capture/wayland.rs`   | `capture-wayland`  | PipeWire + xdg-desktop-portal ScreenCast, with `restore_token`.       |
-| `src/capture/x11.rs`       | `capture-x11`      | XShm root-window capture.                                             |
+| `src/capture/wayland.rs`   | `capture-wayland`  | PipeWire + portal ScreenCast; monitor/window `SourceType` + `restore_token`. |
+| `src/capture/x11.rs`       | `capture-x11`      | XShm capture of the root or a single window (XComposite; re-attach by WM_CLASS). |
 | `src/encode/mod.rs`        | —                  | `Encoder` + `Muxer` traits and backend selectors.                    |
 | `src/encode/gstreamer.rs`  | `encode-gstreamer` | GStreamer hw encode (VA-API/NVENC/x264) + MP4/MKV mux.               |
 | `src/hotkey/mod.rs`        | —                  | `HotkeyManager` trait + selector.                                    |
@@ -120,7 +136,7 @@ the pipeline degrades gracefully, so the default build stays green.
 - [x] Start-at-login via XDG autostart (`--install-autostart`)
 - [ ] Verify the Wayland portal ScreenCast path end-to-end (needs the grant dialog)
 - [ ] Verify hardware encode on a real GPU (VA-API/NVENC)
-- [ ] Per-window capture that re-attaches to the same window across relaunches
+- [x] Per-window capture that re-attaches to the same window across relaunches
       (the X11 behavior people miss on Wayland), with a capture-active-window mode
 - [ ] DMABUF fast path for zero-copy Wayland frames
 - [ ] TOML config loading + first-run setup (persist GUI settings)

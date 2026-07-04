@@ -13,6 +13,7 @@ The usual advice is "OBS has a replay buffer — have it always on, start OBS at
 | The OBS-recipe friction | Rewind's answer |
 |---|---|
 | Re-pick the screen/window on every launch (Wayland portal) | The portal grant is **remembered** (`restore_token`) — approve once, relaunches are silent |
+| No easy way to record just the *current* window | A **capture target** setting — whole screen, a specific window (re-attached across launches), or the **active window** |
 | "Start it at login" is a manual setup step | `rewind --install-autostart` writes the XDG autostart entry for you |
 | Replay buffer is a buried checkbox in a streaming app | Rewind *is* the replay buffer — one window, one job |
 | Hotkey wiring varies by desktop | Portal GlobalShortcuts where available, evdev fallback where not |
@@ -21,6 +22,7 @@ The usual advice is "OBS has a replay buffer — have it always on, start OBS at
 
 - **Background buffer capture** — continuously encode gameplay into a fixed-size ring buffer (configurable duration).
 - **Save-last-N-seconds hotkey** — press a global hotkey to instantly flush the buffer to an `.mp4`/`.mkv` clip.
+- **Per-window capture** — record the whole screen, a specific window (re-found across relaunches), or whichever window is active. On X11 the window is re-attached by its `WM_CLASS`/title and captured via XComposite (so it works even when occluded); on Wayland the portal's `restore_token` handles re-attach.
 - **Audio too** — captures system/game audio via PipeWire and muxes it alongside the video, A/V aligned.
 - **Auto-convert to shareable** — after each save, transcodes the clip to a standard H.264/AAC MP4 (faststart) in the background.
 - **Copy to clipboard (optional)** — off by default; when on, the finished clip is placed on the clipboard as a pasteable file, ready to drop into chat.
@@ -37,7 +39,7 @@ The usual advice is "OBS has a replay buffer — have it always on, start OBS at
 Rewind builds on the standard Linux screen-capture pipeline rather than reinventing it:
 
 - **Wayland:** capture via the **PipeWire** + **xdg-desktop-portal** `ScreenCast` API (the same mechanism OBS and `wf-recorder` use). This is the sanctioned, compositor-agnostic path and works under wlroots (Sway, Hyprland), GNOME, and KDE.
-- **X11:** capture via XComposite / XShm (or PipeWire where available) for legacy sessions.
+- **X11:** capture via XComposite / XShm (or PipeWire where available) for legacy sessions. Single-window capture uses XComposite redirect + `NameWindowPixmap` (occluded windows still record) and re-finds the target across relaunches via `_NET_CLIENT_LIST` / `WM_CLASS`; an active-window mode reads `_NET_ACTIVE_WINDOW`.
 - **Encode/mux:** a **GStreamer** pipeline (or direct VA-API / NVENC) handles hardware-accelerated H.264/HEVC encoding and muxing into `.mp4`/`.mkv`.
 - **Audio:** captured via PipeWire (`pulsesrc`) from the default sink's monitor, encoded to AAC/Opus, and muxed as a second track in the same GStreamer graph.
 - **Share:** a post-save `decodebin → x264enc + AAC → mp4mux(faststart)` transcode produces a universally-playable copy.

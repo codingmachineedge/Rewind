@@ -42,16 +42,31 @@ use ashpd::desktop::PersistMode;
 use ashpd::WindowIdentifier;
 
 use crate::capture::{CaptureError, FrameSink, FrameSource};
-use crate::media::{Frame, PixelFormat, StreamInfo};
+use crate::media::{CaptureTarget, Frame, PixelFormat, StreamInfo};
 
 const BACKEND_NAME: &str = "wayland-pipewire";
 
 /// Public entry point: negotiate a ScreenCast grant and return a ready-to-start
 /// [`FrameSource`]. The portal dialog (and thus any user prompt) happens here in
 /// [`open`]; [`WaylandSource::start`] only wires up the PipeWire stream.
-pub fn open() -> Result<Box<dyn FrameSource>, CaptureError> {
-    let grant = pollster::block_on(negotiate_portal())?;
+///
+/// `target` selects the portal `SourceType` (monitor vs window). The origin
+/// thread's complaint — OBS re-prompting for the share target every launch — is
+/// answered by the persisted `restore_token`, which is stored per source type so
+/// switching between monitor and window capture doesn't clobber the other's
+/// re-attach grant. On Wayland `ActiveWindow` behaves like `Window`: the portal
+/// owns window selection and exposes no active-window API.
+pub fn open(target: CaptureTarget) -> Result<Box<dyn FrameSource>, CaptureError> {
+    let grant = pollster::block_on(negotiate_portal(target))?;
     Ok(Box::new(WaylandSource::new(grant)))
+}
+
+/// The portal `SourceType` for a capture target.
+fn source_type_for(target: CaptureTarget) -> SourceType {
+    match target {
+        CaptureTarget::Monitor => SourceType::Monitor,
+        CaptureTarget::Window | CaptureTarget::ActiveWindow => SourceType::Window,
+    }
 }
 
 /// Everything the portal handed us that PipeWire needs, kept alive for the life
@@ -66,7 +81,7 @@ struct PortalGrant {
 
 /// Perform the full portal handshake. Returns [`CaptureError::PermissionDenied`]
 /// when the user cancels the dialog.
-async fn negotiate_portal() -> Result<PortalGrant, CaptureError> {
+async fn negotiate_portal(target: CaptureTarget) -> Result<PortalGrant, CaptureError> {
     let proxy = Screencast::new()
         .await
         .map_err(map_portal_err)?;
@@ -76,7 +91,7 @@ async fn negotiate_portal() -> Result<PortalGrant, CaptureError> {
         .await
         .map_err(map_portal_err)?;
 
-    let restore_token = load_restore_token();
+    let restore_token = load_restore_token(target);
 
     // NOTE: ashpd 0.9 `select_sources` signature is
     //   select_sources(&session, CursorMode, BitFlags<SourceType>, multiple: bool,
@@ -87,8 +102,8 @@ async fn negotiate_portal() -> Result<PortalGrant, CaptureError> {
         .select_sources(
             &session,
             CursorMode::Embedded,
-            SourceType::Monitor.into(),
-            false, // multiple: single monitor
+            source_type_for(target).into(),
+            false, // multiple: a single monitor or window
             restore_token.as_deref(),
             PersistMode::ExplicitlyRevoked,
         )
@@ -106,7 +121,7 @@ async fn negotiate_portal() -> Result<PortalGrant, CaptureError> {
 
     // Persist the (possibly renewed) restore token so the next launch is silent.
     if let Some(token) = response.restore_token() {
-        save_restore_token(token);
+        save_restore_token(target, token);
     }
 
     let stream = response
@@ -143,17 +158,21 @@ fn map_portal_err(err: ashpd::Error) -> CaptureError {
 
 // --- restore-token persistence -------------------------------------------------
 
-/// `${XDG_CONFIG_HOME:-~/.config}/rewind/screencast.token`.
-fn token_path() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .filter(|p| !p.as_os_str().is_empty())
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-    Some(base.join("rewind").join("screencast.token"))
+/// `${XDG_CONFIG_HOME:-~/.config}/rewind/screencast-{monitor,window}.token`.
+///
+/// The token is stored per source type: a grant for a monitor and a grant for a
+/// window are distinct, and reusing one for the other makes the portal re-prompt.
+fn token_path(target: CaptureTarget) -> Option<PathBuf> {
+    let file = if target.is_window() {
+        "screencast-window.token"
+    } else {
+        "screencast-monitor.token"
+    };
+    Some(crate::capture::config_dir()?.join(file))
 }
 
-fn load_restore_token() -> Option<String> {
-    let path = token_path()?;
+fn load_restore_token(target: CaptureTarget) -> Option<String> {
+    let path = token_path(target)?;
     let token = fs::read_to_string(path).ok()?;
     let token = token.trim();
     if token.is_empty() {
@@ -163,8 +182,8 @@ fn load_restore_token() -> Option<String> {
     }
 }
 
-fn save_restore_token(token: &str) {
-    let Some(path) = token_path() else { return };
+fn save_restore_token(target: CaptureTarget, token: &str) {
+    let Some(path) = token_path(target) else { return };
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }

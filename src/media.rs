@@ -32,6 +32,38 @@ impl PixelFormat {
     }
 }
 
+/// What the capture backend should grab.
+///
+/// The default is [`CaptureTarget::Monitor`] (the whole screen / X11 root
+/// window), preserving the original behavior. The window modes address the
+/// origin-thread request to record a single window and re-attach to it across
+/// relaunches:
+///
+/// - **X11** re-finds the chosen window by its `WM_CLASS`/title (persisted to
+///   `~/.config/rewind/window.target`) and uses XComposite so occluded windows
+///   still capture; [`CaptureTarget::ActiveWindow`] resolves `_NET_ACTIVE_WINDOW`.
+/// - **Wayland** maps window modes to the portal's `SourceType::Window`; the
+///   persisted `restore_token` re-attaches to the same share target without a
+///   re-prompt. The portal has no active-window concept, so `ActiveWindow`
+///   behaves like `Window` there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureTarget {
+    /// The whole monitor / X11 root window (default).
+    Monitor,
+    /// A specific window, re-found across relaunches.
+    Window,
+    /// Whichever window is active when capture starts.
+    ActiveWindow,
+}
+
+impl CaptureTarget {
+    /// Whether this target captures a single window (either explicitly chosen or
+    /// the active one) rather than the whole monitor.
+    pub fn is_window(self) -> bool {
+        matches!(self, CaptureTarget::Window | CaptureTarget::ActiveWindow)
+    }
+}
+
 /// Negotiated properties of an active capture stream.
 #[derive(Debug, Clone, Copy)]
 pub struct StreamInfo {

@@ -22,9 +22,32 @@ use adw::prelude::*;
 use gtk::{Align, Button, Label, Orientation, ToggleButton};
 
 use crate::config::Config;
+use crate::media::CaptureTarget;
 use crate::pipeline::{EventSink, Pipeline, PipelineEvent};
 
 const APP_ID: &str = "org.rewind.Rewind";
+
+/// The capture-target options offered in the GUI, in dropdown order. The index
+/// maps to [`CaptureTarget`] via [`target_from_index`]/[`index_from_target`].
+const CAPTURE_TARGETS: &[(&str, CaptureTarget)] = &[
+    ("Whole screen", CaptureTarget::Monitor),
+    ("Specific window", CaptureTarget::Window),
+    ("Active window", CaptureTarget::ActiveWindow),
+];
+
+fn target_from_index(i: u32) -> CaptureTarget {
+    CAPTURE_TARGETS
+        .get(i as usize)
+        .map(|(_, t)| *t)
+        .unwrap_or(CaptureTarget::Monitor)
+}
+
+fn index_from_target(target: CaptureTarget) -> u32 {
+    CAPTURE_TARGETS
+        .iter()
+        .position(|(_, t)| *t == target)
+        .unwrap_or(0) as u32
+}
 
 const APP_CSS: &str = "
 .status-card {
@@ -156,6 +179,17 @@ fn build_ui(app: &adw::Application) {
     hotkey_row.set_text(&defaults.save_hotkey);
     group.add(&hotkey_row);
 
+    let target_model = gtk::StringList::new(
+        &CAPTURE_TARGETS.iter().map(|(label, _)| *label).collect::<Vec<_>>(),
+    );
+    let target_row = adw::ComboRow::builder()
+        .title("Capture target")
+        .subtitle("Whole screen, a specific window (re-attached across launches), or the active window")
+        .model(&target_model)
+        .build();
+    target_row.set_selected(index_from_target(defaults.capture_target));
+    group.add(&target_row);
+
     let audio_row = adw::SwitchRow::builder()
         .title("Capture audio")
         .subtitle("Mux system audio into the clip")
@@ -257,6 +291,7 @@ fn build_ui(app: &adw::Application) {
         let buffer_row = buffer_row.clone();
         let folder_row = folder_row.clone();
         let hotkey_row = hotkey_row.clone();
+        let target_row = target_row.clone();
         let audio_row = audio_row.clone();
         let convert_row = convert_row.clone();
         let clipboard_row = clipboard_row.clone();
@@ -265,6 +300,7 @@ fn build_ui(app: &adw::Application) {
             cfg.buffer_seconds = buffer_row.value() as u32;
             cfg.output_dir = PathBuf::from(folder_row.text().as_str());
             cfg.save_hotkey = hotkey_row.text().to_string();
+            cfg.capture_target = target_from_index(target_row.selected());
             cfg.capture_audio = audio_row.is_active();
             cfg.auto_convert = convert_row.is_active();
             cfg.copy_to_clipboard = clipboard_row.is_active();
