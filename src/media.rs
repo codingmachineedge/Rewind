@@ -201,3 +201,15 @@ impl Default for EncodeSettings {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capture_target_is_window() {
+        assert!(!CaptureTarget::Monitor.is_window());
+        assert!(CaptureTarget::Window.is_window());
+        assert!(CaptureTarget::ActiveWindow.is_window());
+    }
+}

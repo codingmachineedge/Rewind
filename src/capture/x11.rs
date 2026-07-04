@@ -399,8 +399,17 @@ fn save_window_descriptor(desc: &WindowDescriptor) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    // Values are single-line: newlines in a title would corrupt the format, so
-    // fold them to spaces.
+    let _ = std::fs::write(&path, format_descriptor(desc));
+}
+
+fn load_window_descriptor() -> Option<WindowDescriptor> {
+    let text = std::fs::read_to_string(target_file()?).ok()?;
+    parse_descriptor(&text)
+}
+
+/// Serialize a descriptor to `key=value` lines. Values are single-line, so any
+/// newline in a title is folded to a space to keep the format round-trippable.
+fn format_descriptor(desc: &WindowDescriptor) -> String {
     let clean = |s: &str| s.replace(['\n', '\r'], " ");
     let mut out = String::new();
     if let Some(c) = &desc.class {
@@ -412,22 +421,22 @@ fn save_window_descriptor(desc: &WindowDescriptor) {
     if let Some(t) = &desc.title {
         out.push_str(&format!("title={}\n", clean(t)));
     }
-    let _ = std::fs::write(&path, out);
+    out
 }
 
-fn load_window_descriptor() -> Option<WindowDescriptor> {
-    let path = target_file()?;
-    let text = std::fs::read_to_string(path).ok()?;
+/// Parse `key=value` lines back into a descriptor. Unknown keys are ignored; an
+/// empty/unrecognized document yields `None` (nothing to re-attach to). A `=` in
+/// a value is preserved (only the first `=` splits the line).
+fn parse_descriptor(text: &str) -> Option<WindowDescriptor> {
     let mut desc = WindowDescriptor::default();
     for line in text.lines() {
         let Some((key, value)) = line.split_once('=') else {
             continue;
         };
-        let value = value.to_string();
         match key.trim() {
-            "class" => desc.class = Some(value),
-            "instance" => desc.instance = Some(value),
-            "title" => desc.title = Some(value),
+            "class" => desc.class = Some(value.to_string()),
+            "instance" => desc.instance = Some(value.to_string()),
+            "title" => desc.title = Some(value.to_string()),
             _ => {}
         }
     }
@@ -1003,5 +1012,58 @@ mod shm_impl {
                 self.unmapped = true;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn desc(class: Option<&str>, instance: Option<&str>, title: Option<&str>) -> WindowDescriptor {
+        WindowDescriptor {
+            class: class.map(str::to_string),
+            instance: instance.map(str::to_string),
+            title: title.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn descriptor_round_trips() {
+        let d = desc(Some("steam_app_570"), Some("dota2"), Some("Dota 2"));
+        assert_eq!(parse_descriptor(&format_descriptor(&d)), Some(d));
+    }
+
+    #[test]
+    fn descriptor_round_trips_partial() {
+        // Only a class (no instance/title) is still enough to re-attach.
+        let d = desc(Some("firefox"), None, None);
+        assert_eq!(parse_descriptor(&format_descriptor(&d)), Some(d));
+    }
+
+    #[test]
+    fn parse_ignores_unknown_keys_and_blank_lines() {
+        let text = "class=mpv\n\n# a comment line without '='\nfoo=bar\ntitle=video.mkv\n";
+        assert_eq!(parse_descriptor(text), Some(desc(Some("mpv"), None, Some("video.mkv"))));
+    }
+
+    #[test]
+    fn parse_empty_is_none() {
+        assert_eq!(parse_descriptor(""), None);
+        assert_eq!(parse_descriptor("nonsense without equals\n"), None);
+    }
+
+    #[test]
+    fn value_may_contain_equals() {
+        // Titles routinely contain '='; only the first '=' splits the line.
+        let d = parse_descriptor("title=a=b=c\n").unwrap();
+        assert_eq!(d.title.as_deref(), Some("a=b=c"));
+    }
+
+    #[test]
+    fn newlines_in_title_are_folded() {
+        let d = desc(Some("term"), None, Some("line1\nline2"));
+        // A folded title still round-trips as a single line (spaces for newlines).
+        let parsed = parse_descriptor(&format_descriptor(&d)).unwrap();
+        assert_eq!(parsed.title.as_deref(), Some("line1 line2"));
     }
 }
