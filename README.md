@@ -8,6 +8,15 @@ Rewind continuously records your gameplay into a rolling in-memory buffer and le
 
 Linux gamers have never had a great "instant replay" tool. The mainstream options are Windows-only, and the closest Linux equivalents mean hand-rolling OBS replay buffers or shell scripts. The proprietary recorders that do exist come with baggage: mandatory sign-ins, phone-home telemetry, ballooning background services, and nag screens. Rewind is deliberately *not predatory* — it does one job well, on Linux, and respects you while doing it.
 
+The usual advice is "OBS has a replay buffer — have it always on, start OBS at login, set a hotkey, then it's identical to ShadowPlay." True, but every step of that is friction, and on Wayland OBS famously **asks you to re-select what to share every single time you open it**. Rewind bakes the whole recipe in:
+
+| The OBS-recipe friction | Rewind's answer |
+|---|---|
+| Re-pick the screen/window on every launch (Wayland portal) | The portal grant is **remembered** (`restore_token`) — approve once, relaunches are silent |
+| "Start it at login" is a manual setup step | `rewind --install-autostart` writes the XDG autostart entry for you |
+| Replay buffer is a buried checkbox in a streaming app | Rewind *is* the replay buffer — one window, one job |
+| Hotkey wiring varies by desktop | Portal GlobalShortcuts where available, evdev fallback where not |
+
 ## Planned Features
 
 - **Background buffer capture** — continuously encode gameplay into a fixed-size ring buffer (configurable duration).
@@ -15,6 +24,7 @@ Linux gamers have never had a great "instant replay" tool. The mainstream option
 - **Audio too** — captures system/game audio via PipeWire and muxes it alongside the video, A/V aligned.
 - **Auto-convert to shareable** — after each save, transcodes the clip to a standard H.264/AAC MP4 (faststart) in the background.
 - **Copy to clipboard (optional)** — off by default; when on, the finished clip is placed on the clipboard as a pasteable file, ready to drop into chat.
+- **Start at login** — `rewind --install-autostart` registers an XDG autostart entry (`--uninstall-autostart` removes it), so the buffer is always on, ShadowPlay-style.
 - **Low overhead** — hardware-accelerated capture and GPU (VA-API / NVENC) encoding to minimize FPS impact.
 - **No telemetry, no account** — nothing is uploaded, nothing is tracked, no login required.
 - **Local-first** — clips are written straight to a folder you choose; you own your data.

@@ -16,6 +16,7 @@
 // Feature-gated backends leave several core APIs unused in the default build.
 #![allow(dead_code)]
 
+mod autostart;
 mod buffer;
 mod capture;
 mod clipboard;
@@ -31,6 +32,10 @@ mod gui;
 /// GUI entry point (GTK4 + libadwaita).
 #[cfg(feature = "gui")]
 fn main() {
+    // Handle --install-autostart / --uninstall-autostart before GTK sees argv.
+    if autostart::handle_cli_args() {
+        return;
+    }
     gui::run();
 }
 
@@ -39,6 +44,10 @@ fn main() {
 fn main() {
     use std::sync::Arc;
     use std::time::Duration;
+
+    if autostart::handle_cli_args() {
+        return;
+    }
 
     use config::Config;
     use pipeline::{Pipeline, PipelineEvent};

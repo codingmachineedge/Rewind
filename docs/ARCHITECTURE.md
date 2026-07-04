@@ -117,8 +117,11 @@ the pipeline degrades gracefully, so the default build stays green.
 - [x] Auto-convert saved clips to a shareable H.264/AAC MP4 (faststart)
 - [x] GUI wired to the live pipeline (start/stop, save, settings, status)
 - [x] Runtime-verified end-to-end in a real Ubuntu GNOME session (X11 + audio)
+- [x] Start-at-login via XDG autostart (`--install-autostart`)
 - [ ] Verify the Wayland portal ScreenCast path end-to-end (needs the grant dialog)
 - [ ] Verify hardware encode on a real GPU (VA-API/NVENC)
+- [ ] Per-window capture that re-attaches to the same window across relaunches
+      (the X11 behavior people miss on Wayland), with a capture-active-window mode
 - [ ] DMABUF fast path for zero-copy Wayland frames
 - [ ] TOML config loading + first-run setup (persist GUI settings)
 - [ ] Tray icon / background daemon mode
