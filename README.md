@@ -92,6 +92,10 @@ sudo apt install libgtk-4-dev libadwaita-1-dev \
 
 On Fedora the equivalents are `gtk4-devel`, `libadwaita-devel`, `pipewire-devel`, `gstreamer1-devel`, `gstreamer1-plugins-{good,bad-free}`, etc. Runtime capture also needs your session to provide PipeWire + a desktop portal (Wayland) or an X11 server — see the wiki's **Getting Started** page.
 
+## Troubleshooting
+
+If Rewind ever crashes, the panic is recorded to `~/.local/state/rewind/crash.log` — please attach it to an [issue](../../issues). A failed capture start (missing portal/backend) shows a toast and keeps the app running; see the [wiki's Troubleshooting](../../wiki/Getting-Started#troubleshooting) for session fixes.
+
 ## Contributing
 
 Contributions are welcome. This is an open-source project (MIT licensed) — file an issue or open a PR. See the wiki's **Getting Started** page for a dev-environment walkthrough.
