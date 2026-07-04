@@ -172,14 +172,37 @@ fn token_path(target: CaptureTarget) -> Option<PathBuf> {
 }
 
 fn load_restore_token(target: CaptureTarget) -> Option<String> {
-    let path = token_path(target)?;
-    let token = fs::read_to_string(path).ok()?;
-    let token = token.trim();
-    if token.is_empty() {
-        None
-    } else {
-        Some(token.to_owned())
+    fn read(path: PathBuf) -> Option<String> {
+        let token = fs::read_to_string(path).ok()?;
+        let token = token.trim();
+        if token.is_empty() {
+            None
+        } else {
+            Some(token.to_owned())
+        }
     }
+
+    if let Some(token) = token_path(target).and_then(read) {
+        return Some(token);
+    }
+
+    // Migration: releases before the per-source-type split stored a single
+    // `screencast.token` (monitor only). Fall back to it for Monitor so an
+    // upgrading user isn't re-prompted.
+    if !target.is_window() {
+        if let Some(legacy) = crate::capture::config_dir()
+            .map(|dir| dir.join("screencast.token"))
+            .and_then(read)
+        {
+            // Finalize the migration NOW rather than relying on the portal to echo
+            // a fresh restore_token on Start (some backends return none): copy the
+            // legacy grant into the new per-type file so it's read directly next
+            // launch and the legacy file stops being consulted.
+            save_restore_token(target, &legacy);
+            return Some(legacy);
+        }
+    }
+    None
 }
 
 fn save_restore_token(target: CaptureTarget, token: &str) {

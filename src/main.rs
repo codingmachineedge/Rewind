@@ -59,8 +59,12 @@ fn main() {
     println!("No account. No telemetry. Your footage stays on your machine.\n");
 
     let mut config = Config::default();
-    // Opt-in clipboard copy for headless runs: REWIND_CLIPBOARD=1
-    config.copy_to_clipboard = std::env::var("REWIND_CLIPBOARD").is_ok();
+    // Opt-in clipboard copy for headless runs: REWIND_CLIPBOARD=1 (a set-but-off
+    // value like 0/false must NOT enable it, so parse the value rather than test
+    // presence).
+    config.copy_to_clipboard = std::env::var("REWIND_CLIPBOARD")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
     // Capture target for headless runs: REWIND_CAPTURE_TARGET=monitor|window|active
     if let Ok(t) = std::env::var("REWIND_CAPTURE_TARGET") {
         config.capture_target = match t.to_ascii_lowercase().as_str() {

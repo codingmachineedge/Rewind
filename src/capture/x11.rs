@@ -136,6 +136,25 @@ pub fn open(target: CaptureTarget) -> Result<Box<dyn FrameSource>, CaptureError>
         ));
     }
 
+    // This backend emits 32-bpp ZPixmap frames with stride = width*4. Refuse any
+    // drawable the server packs at a different bits-per-pixel (e.g. a depth-16
+    // window, or a server that stores depth-24 at 24 bpp) — capturing it would
+    // silently shear/scramble the image rather than error. Mainstream Xorg /
+    // XWayland map depth-24/32 to 32 bpp and pass.
+    match bits_per_pixel(&setup_owned, depth) {
+        Some(32) => {}
+        Some(bpp) => {
+            return Err(CaptureError::Unsupported(format!(
+                "x11 capture needs a 32-bpp drawable; depth {depth} is {bpp} bpp on this server"
+            )));
+        }
+        None => {
+            return Err(CaptureError::Unsupported(format!(
+                "x11 server declares no pixmap format for depth {depth}"
+            )));
+        }
+    }
+
     let format = detect_format(&setup_owned, visual);
 
     // Probe SHM only if the SHM path is even compiled in (needs libc).
@@ -160,7 +179,6 @@ pub fn open(target: CaptureTarget) -> Result<Box<dyn FrameSource>, CaptureError>
         conn: Some(Arc::new(conn)),
         root,
         mode,
-        depth,
         has_shm,
         info: Arc::new(Mutex::new(info)),
         running: Arc::new(AtomicBool::new(false)),
@@ -185,22 +203,41 @@ fn resolve_target(
     match target {
         CaptureTarget::Monitor => Ok(TargetMode::Root),
         CaptureTarget::ActiveWindow => {
-            let win = active_window(conn, root)?;
+            // The user is (re)choosing a target, so persist it.
+            let win = active_or_recent_window(conn, root)?;
             save_window_descriptor(&describe_window(conn, win));
             Ok(TargetMode::Window(win))
         }
         CaptureTarget::Window => {
-            // Prefer the remembered window; fall back to the active one so a
-            // first run (nothing saved yet) still captures something sensible.
-            let win = load_window_descriptor()
-                .and_then(|desc| find_window(conn, root, &desc))
-                .or_else(|| active_window(conn, root).ok())
-                .ok_or_else(|| {
-                    CaptureError::Backend(
-                        "no window to capture: none remembered and no active window".into(),
-                    )
-                })?;
-            save_window_descriptor(&describe_window(conn, win));
+            // Prefer the remembered window. If it is re-found, DON'T re-persist:
+            // rewriting the descriptor is what let a transient miss clobber a good
+            // target. Only establish a new saved target when nothing was
+            // remembered; a miss with a remembered target keeps that target intact
+            // so it re-attaches once the window reappears.
+            let remembered = load_window_descriptor();
+            if let Some(win) = remembered
+                .as_ref()
+                .and_then(|desc| find_window(conn, root, desc))
+            {
+                return Ok(TargetMode::Window(win));
+            }
+            // The remembered target wasn't found among viewable windows. If it
+            // exists but is hidden (minimized / on another virtual desktop), don't
+            // silently capture some other window — its composite pixmap isn't valid
+            // until it's mapped, so tell the user to bring it forward.
+            if let Some(desc) = &remembered {
+                if remembered_hidden(conn, root, desc) {
+                    return Err(CaptureError::Backend(
+                        "the remembered window is minimized or on another desktop — \
+                         bring it to the current desktop, then start capture"
+                            .into(),
+                    ));
+                }
+            }
+            let win = active_or_recent_window(conn, root)?;
+            if remembered.is_none() {
+                save_window_descriptor(&describe_window(conn, win));
+            }
             Ok(TargetMode::Window(win))
         }
     }
@@ -218,23 +255,177 @@ fn intern(conn: &RustConnection, name: &[u8]) -> Option<xproto::Atom> {
         .filter(|a| *a != 0)
 }
 
-/// The window id in `_NET_ACTIVE_WINDOW` on the root, or an error if there is no
-/// active window (EWMH not supported, or nothing focused).
-fn active_window(conn: &RustConnection, root: xproto::Window) -> Result<xproto::Window, CaptureError> {
-    let atom = intern(conn, b"_NET_ACTIVE_WINDOW").ok_or_else(|| {
-        CaptureError::Backend("_NET_ACTIVE_WINDOW unsupported (no EWMH window manager?)".into())
-    })?;
-    let reply = conn
-        .get_property(false, root, atom, AtomEnum::WINDOW, 0, 1)?
-        .reply()
-        .map_err(|e| CaptureError::Backend(format!("read _NET_ACTIVE_WINDOW: {e}")))?;
-    let win = reply.value32().and_then(|mut it| it.next()).unwrap_or(0);
-    if win == 0 {
-        return Err(CaptureError::Backend(
-            "no active window to capture (_NET_ACTIVE_WINDOW is None)".into(),
-        ));
+/// The window a capture should follow for "active window" mode: the focused
+/// window, or — when that is Rewind itself (the usual case, since capture is
+/// started by clicking the Rewind window) or unusable — the top-most other
+/// managed window, i.e. the one the user was using just before.
+///
+/// This must never hard-error just because *we* are focused; doing so made
+/// ActiveWindow mode a dead end from the GUI (clicking Start focuses Rewind).
+fn active_or_recent_window(
+    conn: &RustConnection,
+    root: xproto::Window,
+) -> Result<xproto::Window, CaptureError> {
+    // The active window is only accepted if it's a real capture candidate (not
+    // ourselves, not a dock/desktop panel, and currently viewable) — otherwise we
+    // fall through to the most-recently-raised such window, same as the fallback.
+    if let Some(win) = net_active_window(conn, root) {
+        if is_capture_candidate(conn, win) {
+            return Ok(win);
+        }
     }
-    Ok(win)
+    recent_other_window(conn, root).ok_or_else(|| {
+        CaptureError::Backend(
+            "no window to capture — open the window you want to record, then start capture".into(),
+        )
+    })
+}
+
+/// The raw `_NET_ACTIVE_WINDOW` id, or `None` when unset/unsupported.
+fn net_active_window(conn: &RustConnection, root: xproto::Window) -> Option<xproto::Window> {
+    let atom = intern(conn, b"_NET_ACTIVE_WINDOW")?;
+    let win = conn
+        .get_property(false, root, atom, AtomEnum::WINDOW, 0, 1)
+        .ok()?
+        .reply()
+        .ok()?
+        .value32()?
+        .next()?;
+    (win != 0).then_some(win)
+}
+
+/// The most-recently-raised capture candidate: the top-most window in
+/// `_NET_CLIENT_LIST_STACKING` (bottom-to-top, so we scan from the top). Falls
+/// back to the *unordered* `_NET_CLIENT_LIST` — any capturable window — only when
+/// the WM publishes no stacking list; that fallback can't honor "top-most".
+fn recent_other_window(conn: &RustConnection, root: xproto::Window) -> Option<xproto::Window> {
+    if let Some(stack) = stacking_list(conn, root) {
+        if let Some(win) = stack.into_iter().rev().find(|&win| is_capture_candidate(conn, win)) {
+            return Some(win);
+        }
+    }
+    client_list(conn, root)?
+        .into_iter()
+        .find(|&win| is_capture_candidate(conn, win))
+}
+
+/// Whether `win` can be captured as a window target: not our own window, not a
+/// dock/desktop panel, and currently viewable (mapped, not minimized). An
+/// unmapped/minimized window has no composite pixmap and can't be grabbed.
+fn is_capture_candidate(conn: &RustConnection, win: xproto::Window) -> bool {
+    !is_own_window(conn, win) && is_viewable(conn, win) && window_type_is_capturable(conn, win)
+}
+
+/// A window's map state, or `None` if the window is gone (the attributes request
+/// errors — e.g. it was destroyed).
+fn window_map_state(conn: &RustConnection, win: xproto::Window) -> Option<xproto::MapState> {
+    conn.get_window_attributes(win)
+        .ok()?
+        .reply()
+        .ok()
+        .map(|a| a.map_state)
+}
+
+/// Whether a window is currently viewable (mapped and not iconified).
+fn is_viewable(conn: &RustConnection, win: xproto::Window) -> bool {
+    window_map_state(conn, win) == Some(xproto::MapState::VIEWABLE)
+}
+
+/// `_NET_CLIENT_LIST_STACKING` (managed windows, bottom-to-top stacking order).
+fn stacking_list(conn: &RustConnection, root: xproto::Window) -> Option<Vec<xproto::Window>> {
+    let atom = intern(conn, b"_NET_CLIENT_LIST_STACKING")?;
+    let list: Vec<xproto::Window> = conn
+        .get_property(false, root, atom, AtomEnum::WINDOW, 0, u32::MAX)
+        .ok()?
+        .reply()
+        .ok()?
+        .value32()?
+        .collect();
+    (!list.is_empty()).then_some(list)
+}
+
+/// Whether a window is a normal capture candidate (not a desktop or dock/panel).
+/// Windows without `_NET_WM_WINDOW_TYPE` are treated as normal.
+fn window_type_is_capturable(conn: &RustConnection, win: xproto::Window) -> bool {
+    let Some(atom) = intern(conn, b"_NET_WM_WINDOW_TYPE") else {
+        return true;
+    };
+    let Some(reply) = conn
+        .get_property(false, win, atom, AtomEnum::ATOM, 0, 32)
+        .ok()
+        .and_then(|c| c.reply().ok())
+    else {
+        return true;
+    };
+    let types: Vec<u32> = reply.value32().map(|it| it.collect()).unwrap_or_default();
+    if types.is_empty() {
+        return true;
+    }
+    let dock = intern(conn, b"_NET_WM_WINDOW_TYPE_DOCK");
+    let desktop = intern(conn, b"_NET_WM_WINDOW_TYPE_DESKTOP");
+    !types
+        .iter()
+        .any(|t| Some(*t) == dock || Some(*t) == desktop)
+}
+
+/// The `_NET_WM_PID` advertised by a window, if any.
+fn window_pid(conn: &RustConnection, win: xproto::Window) -> Option<u32> {
+    let atom = intern(conn, b"_NET_WM_PID")?;
+    conn.get_property(false, win, atom, AtomEnum::CARDINAL, 0, 1)
+        .ok()?
+        .reply()
+        .ok()?
+        .value32()?
+        .next()
+}
+
+/// A window's `WM_CLIENT_MACHINE` (the host the client runs on), if set. ICCCM
+/// types this as TEXT (STRING / COMPOUND_TEXT / UTF8_STRING), so request
+/// `AnyPropertyType` — a hard-coded STRING request returns zero bytes for a
+/// non-STRING value, which would defeat the cross-host self-window guard.
+fn window_client_machine(conn: &RustConnection, win: xproto::Window) -> Option<String> {
+    let atom = intern(conn, b"WM_CLIENT_MACHINE")?;
+    get_text_property(conn, win, atom, AtomEnum::ANY)
+}
+
+/// This machine's hostname, for matching against `WM_CLIENT_MACHINE`.
+fn local_hostname() -> Option<String> {
+    let mut buf = [0 as libc::c_char; 256];
+    // SAFETY: gethostname writes at most buf.len() bytes into the buffer.
+    if unsafe { libc::gethostname(buf.as_mut_ptr(), buf.len()) } != 0 {
+        return None;
+    }
+    // Guarantee NUL-termination even if the name filled the whole buffer.
+    *buf.last_mut()? = 0;
+    // SAFETY: buf is NUL-terminated within its bounds.
+    unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }
+        .to_str()
+        .ok()
+        .map(str::to_string)
+        // An empty hostname must not defeat the guard: treat it as "unknown" so a
+        // pid match still classifies our own window as own (fail safe).
+        .filter(|s| !s.is_empty())
+}
+
+/// Compare two host names by their first label, case-insensitively, so a FQDN in
+/// `WM_CLIENT_MACHINE` still matches a short `gethostname` (and vice versa).
+fn same_host(a: &str, b: &str) -> bool {
+    let short = |s: &str| s.split('.').next().unwrap_or(s).to_ascii_lowercase();
+    short(a) == short(b)
+}
+
+/// Whether `win` belongs to this process — i.e. it is the Rewind GUI window.
+/// GTK/GDK sets `_NET_WM_PID`, so comparing it to our own pid excludes our own
+/// window. On a shared X display a foreign-host window could carry the same pid,
+/// so if it names a client machine we require that to be ours too.
+fn is_own_window(conn: &RustConnection, win: xproto::Window) -> bool {
+    if window_pid(conn, win) != Some(std::process::id()) {
+        return false;
+    }
+    match window_client_machine(conn, win) {
+        Some(machine) => local_hostname().is_none_or(|host| same_host(&machine, &host)),
+        None => true,
+    }
 }
 
 /// A window's `WM_CLASS` (instance, class) and title, used to re-find it later.
@@ -321,36 +512,81 @@ fn window_visual(conn: &RustConnection, win: xproto::Window) -> Option<xproto::V
 }
 
 /// Re-find the window matching a saved descriptor. Requires the `WM_CLASS` class
-/// to match; the title and instance break ties (so relaunching the same app
-/// picks the same window even if several are open).
+/// to match; the title and instance break ties. Only viewable, non-own, non-panel
+/// windows are considered (a minimized target can't be captured), and an ambiguous
+/// class-only tie is refused (see [`best_match`]).
 fn find_window(
     conn: &RustConnection,
     root: xproto::Window,
     desc: &WindowDescriptor,
 ) -> Option<xproto::Window> {
     let candidates = client_list(conn, root).unwrap_or_else(|| tree_windows(conn, root));
+    let described: Vec<(WindowDescriptor, xproto::Window)> = candidates
+        .into_iter()
+        .filter(|&win| is_capture_candidate(conn, win))
+        .map(|win| (describe_window(conn, win), win))
+        .collect();
+    best_match(&described, desc)
+}
+
+/// Whether the remembered target appears to exist but is currently *not* viewable
+/// (minimized or on another virtual desktop). Used to give a clear error instead
+/// of silently substituting a different window when [`find_window`] (which only
+/// considers viewable windows) finds no match. Matches on the non-empty class.
+fn remembered_hidden(
+    conn: &RustConnection,
+    root: xproto::Window,
+    desc: &WindowDescriptor,
+) -> bool {
+    let Some(class) = desc.class.as_deref() else {
+        return false;
+    };
+    let candidates = client_list(conn, root).unwrap_or_else(|| tree_windows(conn, root));
+    candidates.into_iter().any(|win| {
+        !is_own_window(conn, win)
+            && !is_viewable(conn, win)
+            && describe_window(conn, win).class.as_deref() == Some(class)
+    })
+}
+
+/// Pick the candidate whose descriptor best matches `target`. Scoring: the
+/// `WM_CLASS` class must match (base 2); a matching title adds 2, a matching
+/// instance adds 1. Returns `None` when nothing matches, OR when the top score is
+/// a tie among several candidates — an ambiguous class-only match must not
+/// silently grab an arbitrary same-class window (X11 has no persistent per-window
+/// identity, so guessing would re-attach to the wrong window across relaunches).
+fn best_match(
+    candidates: &[(WindowDescriptor, xproto::Window)],
+    target: &WindowDescriptor,
+) -> Option<xproto::Window> {
     let mut best: Option<(u32, xproto::Window)> = None;
-    for win in candidates {
-        let d = describe_window(conn, win);
-        let class_matches = match (&d.class, &desc.class) {
-            (Some(a), Some(b)) => a == b,
-            _ => false,
-        };
+    let mut tied = false;
+    for (d, win) in candidates {
+        let class_matches = matches!((&d.class, &target.class), (Some(a), Some(b)) if a == b);
         if !class_matches {
             continue;
         }
         let mut score = 2;
-        if desc.title.is_some() && d.title == desc.title {
+        if target.title.is_some() && d.title == target.title {
             score += 2;
         }
-        if desc.instance.is_some() && d.instance == desc.instance {
+        if target.instance.is_some() && d.instance == target.instance {
             score += 1;
         }
-        if best.is_none_or(|(s, _)| score > s) {
-            best = Some((score, win));
+        match best {
+            Some((bs, _)) if score < bs => {}
+            Some((bs, _)) if score == bs => tied = true,
+            _ => {
+                best = Some((score, *win));
+                tied = false;
+            }
         }
     }
-    best.map(|(_, w)| w)
+    if tied {
+        None
+    } else {
+        best.map(|(_, w)| w)
+    }
 }
 
 /// The WM-maintained `_NET_CLIENT_LIST` of managed top-level windows.
@@ -392,9 +628,22 @@ fn target_file() -> Option<std::path::PathBuf> {
     Some(crate::capture::config_dir()?.join("window.target"))
 }
 
+/// A descriptor is worth persisting only if it carries a non-empty `WM_CLASS`
+/// class — the minimum needed to re-find the window later. Persisting a class-less
+/// (or blank-class) descriptor would both defeat re-attach and clobber a prior
+/// good save. The trim guards against an externally corrupted/hand-edited file
+/// (`class=` or `class=   `) slipping past.
+fn saveworthy(desc: &WindowDescriptor) -> bool {
+    desc.class.as_deref().is_some_and(|c| !c.trim().is_empty())
+}
+
 /// Persist the chosen window's identity as `key=value` lines so a later
-/// [`CaptureTarget::Window`] launch can re-find it. Best-effort.
+/// [`CaptureTarget::Window`] launch can re-find it. Best-effort; a descriptor
+/// with no class is dropped rather than allowed to overwrite a good target.
 fn save_window_descriptor(desc: &WindowDescriptor) {
+    if !saveworthy(desc) {
+        return;
+    }
     let Some(path) = target_file() else { return };
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -404,7 +653,11 @@ fn save_window_descriptor(desc: &WindowDescriptor) {
 
 fn load_window_descriptor() -> Option<WindowDescriptor> {
     let text = std::fs::read_to_string(target_file()?).ok()?;
-    parse_descriptor(&text)
+    // Apply the same bar as the save side: a class-less descriptor (e.g. an
+    // externally corrupted/hand-edited file) can never be re-found, so treat it as
+    // "nothing remembered" — resolve_target then re-establishes a usable target
+    // instead of leaving the unusable file in place forever.
+    parse_descriptor(&text).filter(saveworthy)
 }
 
 /// Serialize a descriptor to `key=value` lines. Values are single-line, so any
@@ -426,16 +679,24 @@ fn format_descriptor(desc: &WindowDescriptor) -> String {
 
 /// Parse `key=value` lines back into a descriptor. Unknown keys are ignored; an
 /// empty/unrecognized document yields `None` (nothing to re-attach to). A `=` in
-/// a value is preserved (only the first `=` splits the line).
+/// a value is preserved (only the first `=` splits the line). The `WM_CLASS`
+/// identifier fields (class/instance) are trimmed and blank values dropped —
+/// they never legitimately carry surrounding whitespace, and matching them
+/// against the live (un-padded) `WM_CLASS` requires exact equality, so a
+/// hand-edited `class = mpv` must normalize to `mpv`. The title is kept verbatim.
 fn parse_descriptor(text: &str) -> Option<WindowDescriptor> {
+    let trimmed = |value: &str| -> Option<String> {
+        let t = value.trim();
+        (!t.is_empty()).then(|| t.to_string())
+    };
     let mut desc = WindowDescriptor::default();
     for line in text.lines() {
         let Some((key, value)) = line.split_once('=') else {
             continue;
         };
         match key.trim() {
-            "class" => desc.class = Some(value.to_string()),
-            "instance" => desc.instance = Some(value.to_string()),
+            "class" => desc.class = trimmed(value),
+            "instance" => desc.instance = trimmed(value),
             "title" => desc.title = Some(value.to_string()),
             _ => {}
         }
@@ -571,6 +832,16 @@ fn shm_available(_conn: &RustConnection) -> bool {
     false
 }
 
+/// The server's stored bits-per-pixel for ZPixmap images of `depth`, from the
+/// connection setup's pixmap formats. `None` if the server declares none.
+fn bits_per_pixel(setup: &xproto::Setup, depth: u8) -> Option<u8> {
+    setup
+        .pixmap_formats
+        .iter()
+        .find(|f| f.depth == depth)
+        .map(|f| f.bits_per_pixel)
+}
+
 /// Inspect the visual referenced by `visual_id` to choose a [`PixelFormat`].
 fn detect_format(setup: &xproto::Setup, visual_id: xproto::Visualid) -> PixelFormat {
     let visual = setup
@@ -617,8 +888,6 @@ struct X11Source {
     conn: Option<Arc<RustConnection>>,
     root: xproto::Window,
     mode: TargetMode,
-    /// Depth of the grabbed drawable (root or window).
-    depth: u8,
     has_shm: bool,
     info: Arc<Mutex<StreamInfo>>,
     running: Arc<AtomicBool>,
@@ -656,23 +925,57 @@ impl FrameSource for X11Source {
             TargetMode::Window(win) => setup_window_grab(&conn, win),
         };
 
+        // Keep a spare handle to the connection + the teardown parameters so that
+        // if the thread fails to spawn (the closure that owns `conn`/`source` is
+        // dropped un-run), we can still release the pixmap / undo the redirect.
+        let conn_td = Arc::clone(&conn);
+        let teardown = match &source {
+            GrabSource::Window {
+                window,
+                pixmap,
+                redirected_by_us,
+            } => Some((*window, *pixmap, *redirected_by_us)),
+            _ => None,
+        };
+
         self.running.store(true, Ordering::SeqCst);
 
         let running = Arc::clone(&self.running);
-        let depth = self.depth;
         let has_shm = self.has_shm;
 
-        let handle = std::thread::Builder::new()
+        let spawn_result = std::thread::Builder::new()
             .name("x11-capture".into())
             .spawn(move || {
-                if let Err(e) = capture_loop(&conn, source, depth, has_shm, info, &running, sink) {
+                if let Err(e) = capture_loop(&conn, source, has_shm, info, &running, sink) {
                     // NOTE: the FrameSource contract has no error channel; log and
                     // stop. A production build would surface this to the caller.
                     eprintln!("[x11] capture thread stopped: {e}");
                     running.store(false, Ordering::SeqCst);
                 }
-            })
-            .map_err(|e| CaptureError::Backend(format!("failed to spawn capture thread: {e}")))?;
+            });
+
+        let handle = match spawn_result {
+            Ok(handle) => handle,
+            Err(e) => {
+                // The capture thread never started, so its end-of-loop teardown
+                // never ran. Undo the composite setup and reset state so the
+                // source is left consistent (not stuck "running").
+                if let Some((window, pixmap, redirected_by_us)) = teardown {
+                    teardown_window_grab(
+                        &conn_td,
+                        &GrabSource::Window {
+                            window,
+                            pixmap,
+                            redirected_by_us,
+                        },
+                    );
+                }
+                self.running.store(false, Ordering::SeqCst);
+                return Err(CaptureError::Backend(format!(
+                    "failed to spawn capture thread: {e}"
+                )));
+            }
+        };
 
         self.thread = Some(handle);
         Ok(())
@@ -701,17 +1004,13 @@ impl Drop for X11Source {
 fn capture_loop(
     conn: &RustConnection,
     mut source: GrabSource,
-    depth: u8,
     has_shm: bool,
     info: StreamInfo,
     running: &Arc<AtomicBool>,
     mut sink: FrameSink,
 ) -> Result<(), CaptureError> {
-    debug_assert!(
-        depth == 24 || depth == 32,
-        "x11 capture assumes a 24/32-bit visual so a ZPixmap row is width*4"
-    );
-
+    // open() has already guaranteed the drawable is 32 bpp, so a ZPixmap row is
+    // exactly width*4 bytes.
     let width = info.width;
     let height = info.height;
     let stride = width * BPP;
@@ -742,6 +1041,29 @@ fn capture_loop(
     while running.load(Ordering::SeqCst) {
         let tick = Instant::now();
 
+        // A composite-named pixmap keeps serving a window's last-mapped contents
+        // even after the window is minimized or moved to another virtual desktop
+        // (unmapped WITHOUT a resize, so no BadPixmap fires). Distinguish hidden
+        // from gone: while the source window is merely not viewable, skip frames so
+        // we pause rather than record a frozen still (capture resumes when it comes
+        // back); if the window is destroyed (attributes gone), stop cleanly. Root
+        // capture is always viewable, so this only touches window targets.
+        if let GrabSource::Window { window, .. } | GrabSource::WindowDirect { window } = &source {
+            match window_map_state(conn, *window) {
+                Some(xproto::MapState::VIEWABLE) => {}
+                Some(_) => {
+                    sleep_pacing(frame_interval, tick, running);
+                    continue;
+                }
+                None => {
+                    outcome = Err(CaptureError::Backend(
+                        "captured window was destroyed".into(),
+                    ));
+                    break;
+                }
+            }
+        }
+
         let drawable = source.drawable();
         let grab = grab_frame(conn, &mut shm, drawable, width, height, frame_bytes);
 
@@ -754,9 +1076,14 @@ fn capture_loop(
                 // frame and keep going. Root/direct grabs treat errors as fatal.
                 match &mut source {
                     GrabSource::Window { window, pixmap, .. } => {
-                        let _ = conn.free_pixmap(*pixmap);
+                        // Name a fresh pixmap BEFORE freeing the old one, so a
+                        // failed re-name leaves *pixmap a valid id that teardown
+                        // frees exactly once (avoids a double FreePixmap).
                         match name_window_pixmap(conn, *window) {
-                            Ok(fresh) => *pixmap = fresh,
+                            Ok(fresh) => {
+                                let _ = conn.free_pixmap(*pixmap);
+                                *pixmap = fresh;
+                            }
                             Err(_) => {
                                 // Window is gone (unmapped/destroyed): stop cleanly.
                                 outcome = Err(e);
@@ -1065,5 +1392,121 @@ mod tests {
         // A folded title still round-trips as a single line (spaces for newlines).
         let parsed = parse_descriptor(&format_descriptor(&d)).unwrap();
         assert_eq!(parsed.title.as_deref(), Some("line1 line2"));
+    }
+
+    // --- saveworthy (empty-descriptor clobber guard) ---
+
+    #[test]
+    fn classless_descriptor_is_not_saveworthy() {
+        // Without a WM_CLASS class a descriptor can never be re-found, so it must
+        // not be persisted (it would clobber a prior good target).
+        assert!(!saveworthy(&WindowDescriptor::default()));
+        assert!(!saveworthy(&desc(None, Some("inst"), Some("A Title"))));
+        assert!(saveworthy(&desc(Some("mpv"), None, None)));
+    }
+
+    #[test]
+    fn classless_file_is_treated_as_not_remembered() {
+        // load_window_descriptor filters by saveworthy, so a class-less (corrupted
+        // or hand-edited) file parses to None and self-heals instead of poisoning
+        // every Window-mode launch.
+        assert_eq!(parse_descriptor("title=Foo\n").filter(saveworthy), None);
+        assert_eq!(parse_descriptor("instance=bar\n").filter(saveworthy), None);
+        assert!(parse_descriptor("class=mpv\ntitle=Foo\n")
+            .filter(saveworthy)
+            .is_some());
+    }
+
+    #[test]
+    fn parse_trims_class_and_instance_but_not_title() {
+        // Hand-edited `class = mpv` must normalize to `mpv` so it matches the live
+        // (un-padded) WM_CLASS; the title is kept verbatim.
+        let d = parse_descriptor("class = mpv \ninstance=  inst \ntitle= My Doc \n").unwrap();
+        assert_eq!(d.class.as_deref(), Some("mpv"));
+        assert_eq!(d.instance.as_deref(), Some("inst"));
+        assert_eq!(d.title.as_deref(), Some(" My Doc "));
+    }
+
+    #[test]
+    fn blank_class_does_not_poison_reattach() {
+        // `class=` / `class=   ` must not become Some("") — that would match no live
+        // window yet block the self-heal re-save. It parses to no class and, via
+        // saveworthy, to "nothing remembered".
+        assert_eq!(parse_descriptor("class=\ntitle=Foo\n").and_then(|d| d.class), None);
+        assert_eq!(parse_descriptor("class=   \n").filter(saveworthy), None);
+        assert!(!saveworthy(&desc(Some("   "), None, None)));
+    }
+
+    // --- best_match (window re-find tie-break) ---
+
+    fn cand(class: &str, title: Option<&str>, win: u32) -> (WindowDescriptor, u32) {
+        (desc(Some(class), None, title), win)
+    }
+
+    #[test]
+    fn best_match_unique_class() {
+        let cands = vec![cand("mpv", None, 42)];
+        assert_eq!(best_match(&cands, &desc(Some("mpv"), None, None)), Some(42));
+    }
+
+    #[test]
+    fn best_match_no_class_match_is_none() {
+        let cands = vec![cand("firefox", None, 1)];
+        assert_eq!(best_match(&cands, &desc(Some("chromium"), None, None)), None);
+    }
+
+    #[test]
+    fn best_match_ambiguous_class_only_is_none() {
+        // Two same-class windows, class-only target -> refuse to guess.
+        let cands = vec![cand("Alacritty", None, 1), cand("Alacritty", None, 2)];
+        assert_eq!(best_match(&cands, &desc(Some("Alacritty"), None, None)), None);
+    }
+
+    #[test]
+    fn best_match_title_breaks_tie() {
+        let cands = vec![
+            cand("Alacritty", Some("vim"), 1),
+            cand("Alacritty", Some("bash"), 2),
+        ];
+        assert_eq!(
+            best_match(&cands, &desc(Some("Alacritty"), None, Some("bash"))),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn best_match_two_full_ties_is_none() {
+        // Both match class+title identically -> genuinely ambiguous -> None.
+        let cands = vec![
+            cand("Alacritty", Some("bash"), 1),
+            cand("Alacritty", Some("bash"), 2),
+        ];
+        assert_eq!(
+            best_match(&cands, &desc(Some("Alacritty"), None, Some("bash"))),
+            None
+        );
+    }
+
+    #[test]
+    fn best_match_instance_breaks_tie() {
+        let cands = vec![
+            (desc(Some("Term"), Some("a"), None), 1u32),
+            (desc(Some("Term"), Some("b"), None), 2u32),
+        ];
+        assert_eq!(
+            best_match(&cands, &desc(Some("Term"), Some("b"), None)),
+            Some(2)
+        );
+    }
+
+    // --- same_host (cross-host _NET_WM_PID collision guard) ---
+
+    #[test]
+    fn same_host_matches_short_and_fqdn() {
+        assert!(same_host("box", "box"));
+        assert!(same_host("box.local", "box")); // FQDN vs short first label
+        assert!(same_host("BOX", "box")); // case-insensitive
+        assert!(!same_host("box", "server"));
+        assert!(!same_host("box.example.com", "server.example.com"));
     }
 }

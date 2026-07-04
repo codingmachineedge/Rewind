@@ -70,9 +70,15 @@ dropdown in the GUI:
   `NameWindowPixmap`) lets occluded windows still capture. On Wayland the portal
   owns window selection and the per-target `restore_token` handles re-attach, so
   relaunches don't re-prompt (the origin-thread complaint about OBS).
-- **Active window** — X11 resolves `_NET_ACTIVE_WINDOW` at capture start (and
-  remembers it for Window mode); Wayland treats this as Window (no portal API for
-  the active window).
+- **Active window** — X11 resolves `_NET_ACTIVE_WINDOW` at capture start, falling
+  back to the top-most window in `_NET_CLIENT_LIST_STACKING` when the active window
+  is Rewind itself (clicking Start focuses it), a dock/desktop, or not viewable;
+  the chosen window is remembered for Window mode. Wayland treats this as Window
+  (no portal API for the active window).
+
+Window targets are filtered to viewable, non-own, non-panel windows (own detection
+uses `_NET_WM_PID` + `WM_CLIENT_MACHINE`); a minimized/off-desktop window is paused
+(frames skipped) during capture and rejected at start with a clear message.
 
 ## Encoder & muxer
 
