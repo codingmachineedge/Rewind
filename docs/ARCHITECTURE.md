@@ -92,12 +92,19 @@ head) are muxed and written atomically to the user's output directory.
 
 ## User interface
 
-A native **GTK4 + libadwaita** GUI (`src/gui.rs`, via `gtk4-rs`) provides the
-control surface: a start/stop capture toggle, a "Save last N seconds" button, a
-settings group (buffer length, output folder, hotkey), and a status line — all
-wired to `Config` and `ClipBuffer`. It's gated behind the `gui` cargo feature
+A modern **GTK4 + libadwaita** GUI (`src/gui.rs`, via `gtk4-rs`): a flat-header
+`ToolbarView` over an `adw::Clamp`, a hero status card with a pulsing REC
+indicator and pill Start/Save actions, Adwaita preference rows (buffer length,
+output folder, hotkey, capture target, audio/auto-convert/clipboard switches),
+and `adw::ToastOverlay` notifications for saved/converted clips and errors — all
+wired to the live `Pipeline`. It's gated behind the `gui` cargo feature
 (`cargo run --features gui`) so the headless core still builds without the GTK
-system libraries. The `main.rs` CLI path remains as a headless fallback.
+system libraries. The `main.rs` CLI path remains as a headless fallback (with
+`REWIND_*` env knobs) and installs a crash-logging panic hook first.
+
+GUI callbacks are careful about `RefCell` re-entrancy: GTK signals can fire
+synchronously (e.g. `set_active` re-enters a toggle handler), so the pipeline
+borrow is released before any widget mutation that could re-enter.
 
 ## Modules
 
@@ -115,7 +122,10 @@ system libraries. The `main.rs` CLI path remains as a headless fallback.
 | `src/encode/gstreamer.rs`  | `encode-gstreamer` | GStreamer hw encode (VA-API/NVENC/x264) + MP4/MKV mux.               |
 | `src/hotkey/mod.rs`        | —                  | `HotkeyManager` trait + selector.                                    |
 | `src/hotkey/portal.rs`     | `hotkey`           | Portal GlobalShortcuts, with an evdev fallback.                      |
-| `src/gui.rs`               | `gui`              | GTK4 + libadwaita window wired to the live `Pipeline`.               |
+| `src/gui.rs`               | `gui`              | GTK4 + libadwaita window (ToolbarView, status card, toasts) wired to the live `Pipeline`. |
+| `src/clipboard.rs`         | —                  | Optional copy-of-clip to the clipboard (`wl-copy`/`xclip`/`xsel`).    |
+| `src/autostart.rs`         | —                  | `--install/--uninstall-autostart` (XDG autostart entry).             |
+| `src/crashlog.rs`          | —                  | Panic hook → `$XDG_STATE_HOME/rewind/crash.log` (any thread).         |
 
 The core (everything with no feature) is std-only and compiles on any host; when
 a backend feature is off, its selector returns an "unsupported" error/`None` and
@@ -134,6 +144,9 @@ the pipeline degrades gracefully, so the default build stays green.
 - [x] GUI wired to the live pipeline (start/stop, save, settings, status)
 - [x] Runtime-verified end-to-end in a real Ubuntu GNOME session (X11 + audio)
 - [x] Start-at-login via XDG autostart (`--install-autostart`)
+- [x] Optional copy-clip-to-clipboard after save
+- [x] Modern GUI (ToolbarView, status card + REC, toasts, capture-target picker)
+- [x] Crash logging to `$XDG_STATE_HOME/rewind/crash.log`
 - [ ] Verify the Wayland portal ScreenCast path end-to-end (needs the grant dialog)
 - [ ] Verify hardware encode on a real GPU (VA-API/NVENC)
 - [x] Per-window capture that re-attaches to the same window across relaunches
