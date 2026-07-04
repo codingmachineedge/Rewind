@@ -384,3 +384,28 @@ fn build_ui(app: &adw::Application) {
 
     window.present();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn target_index_round_trips() {
+        for (i, (_, target)) in CAPTURE_TARGETS.iter().enumerate() {
+            assert_eq!(index_from_target(*target), i as u32);
+            assert_eq!(target_from_index(i as u32), *target);
+        }
+    }
+
+    #[test]
+    fn out_of_range_index_falls_back_to_monitor() {
+        assert_eq!(target_from_index(99), CaptureTarget::Monitor);
+    }
+
+    #[test]
+    fn default_target_is_selectable() {
+        // The default config target must have a dropdown row.
+        let idx = index_from_target(Config::default().capture_target);
+        assert!((idx as usize) < CAPTURE_TARGETS.len());
+    }
+}
